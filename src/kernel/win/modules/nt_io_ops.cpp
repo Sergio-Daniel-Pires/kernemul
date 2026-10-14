@@ -1,8 +1,10 @@
 #include "nt_io_ops.hpp"
 #include "../win_kernel.hpp"
+#include "../file_common.hpp"
 #include "../filesystem.hpp"
 #include "../mdl.hpp"
 #include "../objects.hpp"
+#include "../pipe.hpp"
 #include "../pool.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
@@ -46,9 +48,23 @@ enum file_information_class : std::uint32_t
 	file_basic_information          = 4,
 	file_standard_information       = 5,
 	file_internal_information       = 6,
+	file_rename_information         = 10,
+	file_link_information           = 11,
+	file_disposition_information    = 13,
 	file_position_information       = 14,
+	file_mode_information           = 16,
+	file_allocation_information     = 19,
+	file_end_of_file_information    = 20,
 	file_network_open_information   = 34,
+	file_attribute_tag_information  = 35,
+	file_io_completion_notification_information = 41,
+	file_disposition_information_ex = 64,
+	file_rename_information_ex      = 65,
+	file_link_information_ex        = 72,
 };
+
+constexpr std::uint32_t file_disposition_delete = 0x1;
+constexpr std::uint32_t file_disposition_posix_semantics = 0x2;
 
 constexpr std::uint32_t file_fs_device_information = 4;
 constexpr std::uint32_t file_device_disk = 0x07;
@@ -56,15 +72,9 @@ constexpr std::uint32_t file_device_disk = 0x07;
 // FILE_TYPE_CHAR keeps the crt unbuffered; a disk stream would never be flushed here.
 constexpr std::uint32_t file_device_console = 0x50;
 
-constexpr std::uint32_t file_attribute_normal = 0x80;
-constexpr std::uint32_t file_attribute_directory = 0x10;
-
 constexpr std::uint32_t file_directory_file = 0x00000001;
 constexpr std::uint32_t file_non_directory_file = 0x00000040;
-
-// ByteOffset sentinels: either says to carry on from where the file object is.
-constexpr std::int64_t file_use_file_pointer_position = -2;
-constexpr std::int64_t file_write_to_end_of_file = -1;
+constexpr std::uint32_t file_delete_on_close = 0x00001000;
 
 #pragma pack(push, 4)
 struct file_basic_information_t
@@ -124,37 +134,6 @@ static_assert(sizeof(file_basic_information_t) == 0x28);
 static_assert(sizeof(file_standard_information_t) == 0x18);
 static_assert(sizeof(file_network_open_information_t) == 0x38);
 static_assert(sizeof(file_directory_information_t) == 0x40);
-
-std::string object_path(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
-{
-	auto& space = *cpu.curr_addr_space();
-
-	const emu_object<_UNICODE_STRING> name(space, object_attributes
-		? guest_va(object_attributes.field(&_OBJECT_ATTRIBUTES::ObjectName).read())
-		: 0);
-
-	return win_filesystem::normalize(narrow_wstring(win::read_unicode_string(name)));
-}
-
-std::uint64_t file_offset(const emu_object<std::int64_t>& byte_offset,
-	const std::uint64_t position)
-{
-	if (!byte_offset)
-		return position;
-
-	const auto value = byte_offset.read();
-
-	if (value == file_use_file_pointer_position || value == file_write_to_end_of_file)
-		return position;
-
-	return value < 0 ? position : static_cast<std::uint64_t>(value);
-}
-
-struct open_result
-{
-	NTSTATUS status = STATUS_SUCCESS;
-	std::uint64_t information = 0;
-};
 
 // Opening a device is a request of its own rather than a lookup: the driver is sent IRP_MJ_CREATE
 // and may refuse, and the file object built for it is the per-open context every later request on
@@ -257,6 +236,19 @@ open_result write_file_information(addr_space& space, const file_host& host,
 		return {STATUS_SUCCESS, sizeof(std::int64_t)};
 	}
 
+	case file_attribute_tag_information:
+	{
+		if (length < 2 * sizeof(std::uint32_t))
+			return {STATUS_INFO_LENGTH_MISMATCH, 0};
+
+		const std::uint32_t info[2] = {
+			host.directory ? file_attribute_directory : file_attribute_normal, 0 };
+
+		space.write_mem(buffer, info, sizeof(info));
+
+		return {STATUS_SUCCESS, sizeof(info)};
+	}
+
 	case file_internal_information:
 	{
 		if (length < sizeof(std::int64_t))
@@ -275,13 +267,30 @@ open_result write_file_information(addr_space& space, const file_host& host,
 
 open_result open_file(win_kernel_state& state, const std::string& path,
 	const std::uint32_t disposition, const std::uint32_t create_options,
-	emu_object<std::uint64_t> file_handle)
+	const std::uint32_t desired_access, emu_object<std::uint64_t> file_handle)
 {
-	if (path.empty())
+	if (path.empty() || disposition > file_overwrite_if)
 		return { STATUS_OBJECT_NAME_INVALID, 0 };
 
-	const bool is_directory = state.fs.dir_exists(path);
+	bool is_directory = state.fs.dir_exists(path);
 	const bool existed = state.fs.exists(path) || is_directory;
+	std::uint64_t information = file_opened;
+
+	if (!existed && (create_options & file_directory_file)
+		&& (disposition == file_create || disposition == file_open_if))
+	{
+		const auto slash = path.find_last_of('/');
+
+		if (slash != std::string::npos && path.find('/') != slash
+			&& !state.fs.dir_exists(path.substr(0, slash)))
+		{
+			return { STATUS_OBJECT_PATH_NOT_FOUND, 0 };
+		}
+
+		state.fs.create_directory(path);
+		is_directory = true;
+		information = file_created;
+	}
 
 	if (existed && is_directory && (create_options & file_non_directory_file))
 		return { STATUS_FILE_IS_A_DIRECTORY, 0 };
@@ -289,98 +298,271 @@ open_result open_file(win_kernel_state& state, const std::string& path,
 	if (existed && !is_directory && (create_options & file_directory_file))
 		return { STATUS_NOT_A_DIRECTORY, 0 };
 
-	if (is_directory)
-	{
-		auto host = std::make_shared<file_host>();
-		host->file = std::make_shared<win_file>();
-		host->path = path;
+	if (existed && disposition == file_create)
+		return { STATUS_OBJECT_NAME_COLLISION, 0 };
 
-		const std::uint8_t body[sizeof(addr_t)] = {};
-		const auto addr = state.objs.create_object(0, body, sizeof(body),
-			std::move(host), prot_rw | prot_supervisor);
-
-		if (!addr)
-			return { STATUS_INSUFFICIENT_RESOURCES, 0 };
-
-		if (file_handle)
-			file_handle.write(state.sys_proc->handle_table().create_handle(addr, 0));
-
-		return { STATUS_SUCCESS, file_opened };
-	}
-
-	std::shared_ptr<win_file> file;
-	std::uint64_t information = 0;
-
-	switch (disposition)
-	{
-	case file_open:
-		if (!existed)
-			return { STATUS_OBJECT_NAME_NOT_FOUND, 0 };
-		file = state.fs.open(path);
-		information = file_opened;
-		break;
-
-	case file_create:
-		if (existed)
-			return { STATUS_OBJECT_NAME_COLLISION, 0 };
-		file = state.fs.create(path);
-		information = file_created;
-		break;
-
-	case file_open_if:
-		file = existed ? state.fs.open(path) : state.fs.create(path);
-		information = existed ? file_opened : file_created;
-		break;
-
-	case file_overwrite:
-		if (!existed)
-			return { STATUS_OBJECT_NAME_NOT_FOUND, 0 };
-		file = state.fs.create(path);
-		information = file_overwritten;
-		break;
-
-	case file_supersede:
-	case file_overwrite_if:
-		file = state.fs.create(path);
-		information = existed
-			? (disposition == file_supersede ? file_superseded : file_overwritten)
-			: file_created;
-		break;
-
-	default:
-		return { STATUS_INVALID_PARAMETER, 0 };
-	}
-
-	if (!file)
-		return { STATUS_UNSUCCESSFUL, 0 };
+	if (!existed && (disposition == file_open || disposition == file_overwrite))
+		return { STATUS_OBJECT_NAME_NOT_FOUND, 0 };
 
 	auto host = std::make_shared<file_host>();
-	host->file = std::move(file);
 	host->path = path;
+	host->directory = is_directory;
+	host->delete_on_close = (create_options & file_delete_on_close) != 0;
 
-	const std::uint8_t body[sizeof(addr_t)] = {};
-	const auto addr = state.objs.create_object(0, body, sizeof(body),
-		std::move(host), prot_rw | prot_supervisor);
+	if (is_directory)
+	{
+		host->file = std::make_shared<win_file>();
+	}
+	else
+	{
+		const bool keep = existed && (disposition == file_open || disposition == file_open_if);
 
-	if (!addr)
+		host->file = keep ? state.fs.open(path) : state.fs.create(path);
+		information = !existed ? file_created : keep ? file_opened
+			: disposition == file_supersede ? file_superseded : file_overwritten;
+	}
+
+	const auto handle = make_file_handle(state, std::move(host), file_handle_access(desired_access));
+
+	if (!handle)
 		return { STATUS_INSUFFICIENT_RESOURCES, 0 };
 
 	if (file_handle)
-		file_handle.write(state.sys_proc->handle_table().create_handle(addr, 0));
+		file_handle.write(handle);
 
 	return { STATUS_SUCCESS, information };
 }
 
-void write_status_block(emu_object<_IO_STATUS_BLOCK> block, const open_result& result)
+std::optional<open_result> open_pipe(vcpu& cpu, win_kernel_state& state, const std::string& path,
+	const std::uint32_t options, const std::uint32_t desired_access,
+	emu_object<std::uint64_t> file_handle)
 {
-	if (!block)
-		return;
+	const auto key = pipe_manager::pipe_key(path);
 
-	_IO_STATUS_BLOCK status{};
-	status.Status = static_cast<std::int32_t>(result.status);
-	status.Information = result.information;
+	if (!key)
+		return std::nullopt;
 
-	block.write(status);
+	std::shared_ptr<pipe_host> host;
+	open_result result;
+
+	if (key->empty())
+	{
+		host = pipe_manager::open_root(options);
+	}
+	else
+	{
+		const auto opened = state.pipes->open_client(cpu, *key, options, host);
+		result = { opened.status, opened.information };
+	}
+
+	if (result.status == STATUS_SUCCESS && file_handle)
+		file_handle.write(make_file_handle(state, std::move(host), file_handle_access(desired_access)));
+
+	return result;
+}
+
+NTSTATUS rename_target(win_kernel_state& state, addr_space& space, const addr_t buffer,
+	const std::uint32_t length, std::string& out)
+{
+	constexpr std::size_t name_offset = 0x14;
+
+	if (length < name_offset)
+		return STATUS_INFO_LENGTH_MISMATCH;
+
+	const auto root = space.read_mem<std::uint64_t>(buffer + 0x08);
+	const auto name_length = space.read_mem<std::uint32_t>(buffer + 0x10);
+
+	if (name_length % sizeof(char16_t) || name_offset + std::size_t{name_length} > length)
+		return STATUS_INVALID_PARAMETER;
+
+	std::u16string wide(name_length / sizeof(char16_t), u'\0');
+
+	if (name_length)
+		space.read_mem(buffer + name_offset, wide.data(), name_length);
+
+	out = win_filesystem::normalize(narrow_wstring(wide));
+
+	if (out.empty())
+		return STATUS_OBJECT_NAME_INVALID;
+
+	if (!root)
+		return STATUS_SUCCESS;
+
+	const auto directory = state.sys_proc->handle_table().get_object<file_host>(root);
+
+	if (!directory)
+		return STATUS_INVALID_HANDLE;
+
+	if (!directory->directory)
+		return STATUS_OBJECT_TYPE_MISMATCH;
+
+	out = directory->path + "/" + out;
+
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS rename_status_to_ntstatus(const win_filesystem::rename_status status)
+{
+	switch (status)
+	{
+	case win_filesystem::rename_status::renamed:        return STATUS_SUCCESS;
+	case win_filesystem::rename_status::not_found:      return STATUS_OBJECT_NAME_NOT_FOUND;
+	case win_filesystem::rename_status::collision:      return STATUS_OBJECT_NAME_COLLISION;
+	case win_filesystem::rename_status::path_not_found: return STATUS_OBJECT_PATH_NOT_FOUND;
+	case win_filesystem::rename_status::unsupported:    return STATUS_NOT_SUPPORTED;
+	}
+
+	return STATUS_UNSUCCESSFUL;
+}
+
+NTSTATUS set_disposition(win_kernel_state& state, file_host& host, const bool remove,
+	const bool immediately)
+{
+	if (remove && host.directory)
+	{
+		if (!state.fs.dir_exists(host.path))
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+
+		if (state.fs.directory_has_entries(host.path))
+			return STATUS_DIRECTORY_NOT_EMPTY;
+	}
+
+	if (remove && immediately)
+		delete_host(state, host);
+
+	host.delete_on_close = remove && !immediately;
+
+	return STATUS_SUCCESS;
+}
+
+open_result set_file_information(win_kernel_state& state, vcpu& cpu,
+	const std::uint64_t file_handle, const addr_t buffer, const std::uint32_t length,
+	const std::uint32_t info_class)
+{
+	auto& handles = state.sys_proc->handle_table();
+
+	if (const auto pipe = handles.get_object<pipe_host>(file_handle))
+	{
+		const auto result = state.pipes->set_information(cpu, *pipe, info_class, buffer, length);
+		return { result.status, result.information };
+	}
+
+	const auto host = handles.get_object<file_host>(file_handle);
+
+	if (!host)
+		return { STATUS_INVALID_HANDLE, 0 };
+
+	auto& space = *cpu.curr_addr_space();
+
+	if (info_class == file_mode_information || info_class == file_io_completion_notification_information)
+		return { length < sizeof(std::uint32_t) ? STATUS_INFO_LENGTH_MISMATCH : STATUS_SUCCESS, 0 };
+
+	if (host->is_device() || host->console)
+		return { STATUS_INVALID_DEVICE_REQUEST, 0 };
+
+	switch (info_class)
+	{
+	case file_basic_information:
+		return { length < sizeof(file_basic_information_t) ? STATUS_INFO_LENGTH_MISMATCH : STATUS_SUCCESS, 0 };
+
+	case file_position_information:
+	case file_end_of_file_information:
+	case file_allocation_information:
+	{
+		if (length < sizeof(std::int64_t))
+			return { STATUS_INFO_LENGTH_MISMATCH, 0 };
+
+		const auto value = space.read_mem<std::int64_t>(buffer);
+
+		if (value < 0)
+			return { STATUS_INVALID_PARAMETER, 0 };
+
+		if (info_class == file_position_information)
+		{
+			host->position = static_cast<std::uint64_t>(value);
+		}
+		else if (host->directory)
+		{
+			return { STATUS_FILE_IS_A_DIRECTORY, 0 };
+		}
+		else if (info_class == file_end_of_file_information || static_cast<std::size_t>(value) < host->file->size())
+		{
+			host->file->resize(static_cast<std::size_t>(value));
+		}
+
+		return { STATUS_SUCCESS, 0 };
+	}
+
+	case file_disposition_information:
+	case file_disposition_information_ex:
+	{
+		const bool ex = info_class == file_disposition_information_ex;
+
+		if (length < (ex ? sizeof(std::uint32_t) : sizeof(std::uint8_t)))
+			return { STATUS_INFO_LENGTH_MISMATCH, 0 };
+
+		const auto flags = ex ? space.read_mem<std::uint32_t>(buffer)
+			: space.read_mem<std::uint8_t>(buffer) ? file_disposition_delete : 0;
+
+		return { set_disposition(state, *host, flags & file_disposition_delete,
+			flags & file_disposition_posix_semantics), 0 };
+	}
+
+	case file_rename_information:
+	case file_rename_information_ex:
+	case file_link_information:
+	case file_link_information_ex:
+	{
+		const bool ex = info_class == file_rename_information_ex || info_class == file_link_information_ex;
+		const bool linking = info_class == file_link_information || info_class == file_link_information_ex;
+
+		if (length < sizeof(std::uint32_t))
+			return { STATUS_INFO_LENGTH_MISMATCH, 0 };
+
+		const bool replace = ex ? space.read_mem<std::uint32_t>(buffer) & 1
+			: space.read_mem<std::uint8_t>(buffer) != 0;
+
+		std::string target;
+
+		if (const auto status = rename_target(state, space, buffer, length, target); status != STATUS_SUCCESS)
+			return { status, 0 };
+
+		if (!linking)
+		{
+			const auto status = rename_status_to_ntstatus(state.fs.rename(host->path, target, replace));
+
+			if (status == STATUS_SUCCESS)
+				host->path = target;
+
+			return { status, 0 };
+		}
+
+		if (host->directory)
+			return { STATUS_FILE_IS_A_DIRECTORY, 0 };
+
+		if (state.fs.exists(target) || state.fs.dir_exists(target))
+		{
+			if (!replace || state.fs.dir_exists(target))
+				return { STATUS_OBJECT_NAME_COLLISION, 0 };
+
+			state.fs.unlink(target);
+		}
+
+		const auto slash = target.find_last_of('/');
+
+		if (slash != std::string::npos && target.find('/') != slash
+			&& !state.fs.dir_exists(target.substr(0, slash)))
+		{
+			return { STATUS_OBJECT_PATH_NOT_FOUND, 0 };
+		}
+
+		return { state.fs.link(host->path, target) ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND, 0 };
+	}
+
+	default:
+		THREAD_LOG_WARN("NtSetInformationFile('{}'): unhandled class {}", host->path, info_class);
+		return { STATUS_INVALID_INFO_CLASS, 0 };
+	}
 }
 
 }
@@ -553,7 +735,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 
 			const auto result = device
 				? open_device(cpu, *st, device, path, file_handle)
-				: open_file(*st, path, disposition, create_options, file_handle);
+				: open_file(*st, path, disposition, create_options, desired_access, file_handle);
 
 			write_status_block(io_status_block, result);
 
@@ -644,17 +826,46 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const std::uint32_t create_disposition, const std::uint32_t create_options,
 		const addr_t ea_buffer, const std::uint32_t ea_length) -> NTSTATUS
 	{
-		const auto path = object_path(cpu, object_attributes);
+		const auto path = object_path(*st, cpu, object_attributes);
 
 		if (file_handle)
 			file_handle.write(0);
 
+		if (const auto piped = open_pipe(cpu, *st, path, create_options, desired_access, file_handle))
+		{
+			write_status_block(io_status_block, *piped);
+			return piped->status;
+		}
+
 		// A device name is not in the filesystem, so it is resolved before it can be missed.
 		const auto device = st->find_device(path);
 
+		ea_parse_result extended;
+
+		if (!device && ea_buffer && ea_length)
+		{
+			std::vector<std::uint8_t> raw(ea_length);
+			cpu.curr_addr_space()->read_mem(ea_buffer, raw.data(), raw.size());
+
+			extended = parse_ea_chain(raw);
+
+			if (extended.status != STATUS_SUCCESS)
+				return finish(io_status_block, extended.status);
+		}
+
 		const auto result = device
 			? open_device(cpu, *st, device, path, file_handle)
-			: open_file(*st, path, create_disposition, create_options, file_handle);
+			: open_file(*st, path, create_disposition, create_options, desired_access, file_handle);
+
+		if (!extended.items.empty() && result.status == STATUS_SUCCESS && result.information != file_opened)
+		{
+			if (const auto host = st->sys_proc->handle_table().get_object<file_host>(
+				file_handle.read()); host && host->file && !host->directory)
+			{
+				for (auto& item : extended.items)
+					set_extended_attribute(*host->file, std::move(item));
+			}
+		}
 
 		write_status_block(io_status_block, result);
 
@@ -672,16 +883,23 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			emu_object<_IO_STATUS_BLOCK> io_status_block, const std::uint32_t share_access,
 			const std::uint32_t open_options) -> NTSTATUS
 		{
-			const auto path = object_path(cpu, object_attributes);
+			const auto path = object_path(*st, cpu, object_attributes);
 
 			if (file_handle)
 				file_handle.write(0);
+
+			if (const auto piped = open_pipe(cpu, *st, path, open_options, desired_access,
+				file_handle))
+			{
+				write_status_block(io_status_block, *piped);
+				return piped->status;
+			}
 
 			const auto device = st->find_device(path);
 
 			const auto result = device
 				? open_device(cpu, *st, device, path, file_handle)
-				: open_file(*st, path, file_open, open_options, file_handle);
+				: open_file(*st, path, file_open, open_options, desired_access, file_handle);
 
 			write_status_block(io_status_block, result);
 
@@ -692,13 +910,29 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		});
 
 	auto read_file = [st](vcpu& cpu, const std::uint64_t file_handle,
-		[[maybe_unused]] const std::uint64_t event,
+		const std::uint64_t event,
 		[[maybe_unused]] const addr_t apc_routine, [[maybe_unused]] const addr_t apc_context,
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
 		[[maybe_unused]] emu_object<std::uint32_t> key) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (const auto pipe = st->sys_proc->handle_table().get_object<pipe_host>(file_handle))
+		{
+			if (!buffer || !length)
+				return finish(io_status_block, STATUS_INVALID_PARAMETER);
+
+			const auto result = st->pipes->read(cpu, *pipe,
+				{ buffer, length, io_status_block.address(), event });
+
+			if (result.pending)
+				return result.status;
+
+			signal_io_event(*st, cpu, event);
+
+			return finish(io_status_block, result.status, result.information);
+		}
 
 		if (!host || !host->file)
 		{
@@ -726,11 +960,16 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		}
 
 		const auto copied = std::min<std::uint64_t>(length, data.size() - offset);
+
+		if (lock_blocks(*host->file, offset, copied, host.get(), false))
+			return finish(io_status_block, STATUS_FILE_LOCK_CONFLICT);
+
 		cpu.curr_addr_space()->write_mem(buffer, data.data() + offset, copied);
 
 		host->position = offset + copied;
 
 		write_status_block(io_status_block, {STATUS_SUCCESS, copied});
+		signal_io_event(*st, cpu, event);
 
 		THREAD_LOG_INFO("NtReadFile('{}', offset={}, {} bytes asked) -> {} bytes",
 			host->path, offset, length, copied);
@@ -739,13 +978,28 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 	};
 
 	auto write_file = [st](vcpu& cpu, const std::uint64_t file_handle,
-		[[maybe_unused]] const std::uint64_t event,
+		const std::uint64_t event,
 		[[maybe_unused]] const addr_t apc_routine, [[maybe_unused]] const addr_t apc_context,
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
 		[[maybe_unused]] emu_object<std::uint32_t> key) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (const auto pipe = st->sys_proc->handle_table().get_object<pipe_host>(file_handle))
+		{
+			if (!buffer || !length)
+				return finish(io_status_block, STATUS_INVALID_PARAMETER);
+
+			std::vector<std::uint8_t> data(length);
+			cpu.curr_addr_space()->read_mem(buffer, data.data(), length);
+
+			const auto result = st->pipes->write(cpu, *pipe, data);
+
+			signal_io_event(*st, cpu, event);
+
+			return finish(io_status_block, result.status, result.information);
+		}
 
 		if (!host || (!host->file && !host->console))
 		{
@@ -774,26 +1028,17 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_SUCCESS;
 		}
 
-		const auto offset = file_offset(byte_offset, host->position);
+		const auto offset = write_offset(*host, byte_offset);
 
-		// win_file::write replaces the file, so an offset write rebuilds it around the new bytes.
-		const auto current = host->file->data();
+		if (lock_blocks(*host->file, offset, length, host.get(), true))
+			return finish(io_status_block, STATUS_FILE_LOCK_CONFLICT);
 
-		if (offset + length > current.size())
-		{
-			std::vector<std::uint8_t> grown(current.begin(), current.end());
-			grown.resize(offset + length, 0);
-			std::memcpy(grown.data() + offset, bytes.data(), length);
-			host->file->write(grown.data(), grown.size());
-		}
-		else
-		{
-			std::memcpy(host->file->data().data() + offset, bytes.data(), length);
-		}
+		write_file_bytes(*host->file, offset, bytes);
 
 		host->position = offset + length;
 
 		write_status_block(io_status_block, {STATUS_SUCCESS, length});
+		signal_io_event(*st, cpu, event);
 
 		THREAD_LOG_INFO("NtWriteFile('{}', offset={}, {} bytes)", host->path, offset, length);
 
@@ -805,6 +1050,14 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const std::uint32_t length, const std::uint32_t file_information_class) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (const auto pipe = st->sys_proc->handle_table().get_object<pipe_host>(file_handle))
+		{
+			const auto result = st->pipes->query_information(cpu, *pipe, file_information_class,
+				file_information, length);
+
+			return finish(io_status_block, result.status, result.information);
+		}
 
 		if (!host || !host->file)
 		{
@@ -843,78 +1096,6 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		return STATUS_SUCCESS;
 	};
 
-	// One entry per call; the scan position rides on the file object, so RestartScan rewinds it.
-	auto query_directory_file = [st](vcpu& cpu, const std::uint64_t file_handle,
-		[[maybe_unused]] const std::uint64_t event,
-		[[maybe_unused]] const addr_t apc_routine, [[maybe_unused]] const addr_t apc_context,
-		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t file_information,
-		const std::uint32_t length, const std::uint32_t file_information_class,
-		const bool return_single_entry, emu_object<_UNICODE_STRING> file_name,
-		const bool restart_scan) -> NTSTATUS
-	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
-
-		if (!host)
-		{
-			write_status_block(io_status_block, {STATUS_INVALID_HANDLE, 0});
-			return STATUS_INVALID_HANDLE;
-		}
-
-		if (file_information_class != file_directory_information
-			&& file_information_class != file_both_directory_information
-			&& file_information_class != file_full_directory_information)
-		{
-			THREAD_LOG_WARN("NtQueryDirectoryFile: unhandled class {}", file_information_class);
-			write_status_block(io_status_block, {STATUS_INVALID_INFO_CLASS, 0});
-			return STATUS_INVALID_INFO_CLASS;
-		}
-
-		if (restart_scan)
-			host->position = 0;
-
-		const auto entries = st->fs.list_dir(host->path);
-
-		if (host->position >= entries.size())
-		{
-			THREAD_LOG_INFO("NtQueryDirectoryFile('{}'): {} entries, so that is the end",
-				host->path, entries.size());
-
-			write_status_block(io_status_block, {STATUS_NO_MORE_FILES, 0});
-			return STATUS_NO_MORE_FILES;
-		}
-
-		const auto& entry = entries[static_cast<std::size_t>(host->position)];
-		const auto wide = widen_string(entry.name);
-		const auto name_bytes = static_cast<std::uint32_t>(wide.size() * sizeof(char16_t));
-		const auto needed = sizeof(file_directory_information_t) + name_bytes;
-
-		if (length < needed)
-		{
-			write_status_block(io_status_block, {STATUS_BUFFER_TOO_SMALL, 0});
-			return STATUS_BUFFER_TOO_SMALL;
-		}
-
-		file_directory_information_t info{};
-		info.next_entry_offset = 0;
-		info.end_of_file = static_cast<std::int64_t>(entry.size);
-		info.allocation_size = info.end_of_file;
-		info.file_attributes = entry.is_directory ? file_attribute_directory : file_attribute_normal;
-		info.file_name_length = name_bytes;
-
-		auto& space = *cpu.curr_addr_space();
-		emu_object<file_directory_information_t>(space, file_information).write(info);
-		space.write_mem(file_information + sizeof(info), wide.data(), name_bytes);
-
-		++host->position;
-
-		write_status_block(io_status_block, {STATUS_SUCCESS, needed});
-
-		THREAD_LOG_INFO("NtQueryDirectoryFile('{}', single={}, filter='{}') -> '{}'",
-			host->path, return_single_entry,
-			narrow_wstring(win::read_unicode_string(file_name)), entry.name);
-
-		return STATUS_SUCCESS;
-	};
 
 	auto query_attributes_file = [st](vcpu& cpu,
 		emu_object<_OBJECT_ATTRIBUTES> object_attributes, const addr_t file_information,
@@ -962,9 +1143,11 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t fs_information,
 		const std::uint32_t length, const std::uint32_t fs_information_class) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		auto& handles = st->sys_proc->handle_table();
+		const auto host = handles.get_object<file_host>(file_handle);
+		const bool pipe = handles.get_object<pipe_host>(file_handle) != nullptr;
 
-		if (!host)
+		if (!host && !pipe)
 		{
 			write_status_block(io_status_block, {STATUS_INVALID_HANDLE, 0});
 			return STATUS_INVALID_HANDLE;
@@ -981,13 +1164,11 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			}
 
 			const file_fs_device_information_t info{
-				host->console ? file_device_console : file_device_disk, 0};
+				pipe ? file_device_named_pipe : host->console ? file_device_console : file_device_disk,
+				0};
 			emu_object<file_fs_device_information_t>(space, fs_information).write(info);
 
 			write_status_block(io_status_block, {STATUS_SUCCESS, sizeof(info)});
-
-			THREAD_LOG_INFO("NtQueryVolumeInformationFile('{}', FileFsDeviceInformation)",
-				host->path);
 
 			return STATUS_SUCCESS;
 		}
@@ -1003,8 +1184,20 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 	state.redirect_ntzw(mod, "ReadFile", read_file);
 	state.redirect_ntzw(mod, "WriteFile", write_file);
 	state.redirect_ntzw(mod, "QueryInformationFile", query_information_file);
+
+	state.redirect_ntzw(mod, "SetInformationFile",
+		[st](vcpu& cpu, const std::uint64_t file_handle,
+			emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t file_information,
+			const std::uint32_t length, const std::uint32_t file_information_class) -> NTSTATUS
+		{
+			const auto result = set_file_information(*st, cpu, file_handle, file_information,
+				length, file_information_class);
+
+			write_status_block(io_status_block, result);
+
+			return result.status;
+		});
 	state.redirect_ntzw(mod, "FlushBuffersFile", flush_buffers_file);
-	state.redirect_ntzw(mod, "QueryDirectoryFile", query_directory_file);
 	state.redirect_ntzw(mod, "QueryVolumeInformationFile", query_volume_information_file);
 
 	state.redirect_ntzw(mod, "QueryAttributesFile",
@@ -1031,6 +1224,20 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const addr_t output_buffer, const std::uint32_t output_length,
 		const std::string_view who) -> NTSTATUS
 	{
+		if (const auto pipe = st->sys_proc->handle_table().get_object<pipe_host>(file_handle))
+		{
+			const auto result = st->pipes->control(cpu, *pipe, control_code, input_buffer,
+				input_length, output_buffer, output_length,
+				{ output_buffer, output_length, io_status_block.address(), event });
+
+			if (result.pending)
+				return result.status;
+
+			signal_io_event(*st, cpu, event);
+
+			return finish(io_status_block, result.status, result.information);
+		}
+
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
 
 		if (!host)
