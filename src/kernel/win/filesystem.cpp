@@ -3,6 +3,8 @@
 #include "../../util/file.hpp"
 #include "../../util/log.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -102,6 +104,70 @@ bool win_filesystem::remove(const std::string_view path)
 
 	files_.erase(it);
 	return true;
+}
+
+bool win_filesystem::unlink(const std::string_view path)
+{
+	return files_.erase(normalize(path)) != 0;
+}
+
+bool win_filesystem::directory_has_entries(const std::string_view path) const
+{
+	const auto prefix = normalize(path) + "/";
+
+	for (const auto& [key, _] : files_)
+	{
+		if (key.starts_with(prefix))
+			return true;
+	}
+
+	for (const auto& dir : dirs_)
+	{
+		if (dir.starts_with(prefix))
+			return true;
+	}
+
+	return false;
+}
+
+bool win_filesystem::remove_directory(const std::string_view path)
+{
+	if (directory_has_entries(path))
+		return false;
+
+	return dirs_.erase(normalize(path)) != 0;
+}
+
+win_filesystem::rename_status win_filesystem::rename(const std::string_view from,
+	const std::string_view to, const bool replace_existing)
+{
+	const auto source = normalize(from);
+	const auto target = normalize(to);
+
+	if (!files_.contains(source))
+		return dir_exists(source) ? rename_status::unsupported : rename_status::not_found;
+
+	if (source == target)
+		return rename_status::renamed;
+
+	const auto slash = target.find_last_of('/');
+
+	if (slash != std::string::npos && target.find('/') != slash && !dir_exists(target.substr(0, slash)))
+		return rename_status::path_not_found;
+
+	if (files_.contains(target) || dir_exists(target))
+	{
+		if (!replace_existing || dir_exists(target))
+			return rename_status::collision;
+
+		files_.erase(target);
+	}
+
+	auto node = files_.extract(source);
+	node.key() = target;
+	files_.insert(std::move(node));
+
+	return rename_status::renamed;
 }
 
 bool win_filesystem::exists(const std::string_view path) const

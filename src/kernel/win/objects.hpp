@@ -1,6 +1,7 @@
 #pragma once
 #include "dispatcher.hpp"
 #include "filesystem.hpp"
+#include "token.hpp"
 #include "win_obj_manager.hpp"
 
 #include <cstdint>
@@ -24,7 +25,36 @@ struct file_host final : win_object
 	addr_t device_object = 0;
 	addr_t file_object = 0;
 
+	bool directory = false;
+	bool delete_on_close = false;
+
+	std::string dir_filter;
+	bool dir_started = false;
+
+	std::uint32_t ea_scan = 0;
+
 	[[nodiscard]] bool is_device() const noexcept { return device_object != 0; }
+};
+
+struct pipe_host final : win_object
+{
+	std::string path;
+	std::shared_ptr<struct pipe_instance> instance;
+	std::uint64_t generation = 0;
+	bool server = false;
+	bool message_read = false;
+	bool nonblocking = false;
+	bool synchronous = false;
+};
+
+struct directory_host final : win_object
+{
+	std::string name;
+};
+
+struct process_object final : win_object
+{
+	std::uint64_t pid = 0;
 };
 
 // The driver behind a device object, kept host side so a driver overrunning its own extension
