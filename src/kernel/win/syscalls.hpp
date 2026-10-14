@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 
@@ -28,8 +29,11 @@ struct win_syscall
 
 	[[nodiscard]] std::size_t size() const noexcept { return ids_.size(); }
 
+	[[nodiscard]] std::string_view name(std::uint32_t id) const;
+
 private:
 	std::unordered_map<std::uint32_t, addr_t> ids_;
+	std::unordered_map<std::uint32_t, std::string> names_;
 };
 
 // Null where there is no implementation yet.

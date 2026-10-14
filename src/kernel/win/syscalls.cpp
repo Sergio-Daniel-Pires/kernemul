@@ -42,6 +42,8 @@ void win_syscall::add(const std::string_view name, const std::span<const std::ui
 		if (!number)
 			continue;
 
+		names_[*number] = std::string(exp.name);
+
 		const auto handler = impl.find_symbol(exp.name);
 
 		if (!handler)
@@ -56,6 +58,13 @@ void win_syscall::add(const std::string_view name, const std::span<const std::ui
 
 	LOG_INFO("syscalls: {} -> {}: {} numbered, {} with no symbol to point at",
 		name, impl.name, numbered, unresolved);
+}
+
+std::string_view win_syscall::name(const std::uint32_t id) const
+{
+	const auto it = names_.find(id);
+
+	return it != names_.end() ? std::string_view(it->second) : std::string_view();
 }
 
 std::optional<addr_t> win_syscall::find(const std::uint32_t id) const

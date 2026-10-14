@@ -28,7 +28,7 @@ state.redirect(mod, "KeSetEvent",
 
 ### What functions are redirected so far?
 
-Currently, over 380+ functions are reimplemented in the kernel (120 of which are syscalls). Feel free to make a pull request with more implementations as this will allow more advanced apps to be supported. The kernel types were built for the version 26100 of the Windows kernel.
+Currently, over 460+ functions are reimplemented in the kernel (155+ of which are syscalls). Feel free to make a pull request with more implementations as this will allow more advanced apps to be supported. The kernel types were built for the version 26100 of the Windows kernel.
 
 ### Architecture abstraction
 

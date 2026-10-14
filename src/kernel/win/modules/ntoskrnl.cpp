@@ -24,6 +24,10 @@
 #include "nt_ctx_ops.hpp"
 #include "nt_iocp_ops.hpp"
 #include "nt_lpc_ops.hpp"
+#include "nt_token_ops.hpp"
+#include "nt_process_create_ops.hpp"
+#include "nt_file_ops.hpp"
+#include "nt_pipe_ops.hpp"
 
 void modules::register_ntoskrnl(win_kernel_state& state, proc_module& mod)
 {
@@ -52,4 +56,8 @@ void modules::register_ntoskrnl(win_kernel_state& state, proc_module& mod)
 	register_ntoskrnl_ctx_ops(state, mod);
 	register_ntoskrnl_iocp_ops(state, mod);
 	register_ntoskrnl_lpc_ops(state, mod);
+	register_ntoskrnl_token_ops(state, mod);
+	register_ntoskrnl_process_create_ops(state, mod);
+	register_ntoskrnl_file_ops(state, mod);
+	register_ntoskrnl_pipe_ops(state, mod);
 }
