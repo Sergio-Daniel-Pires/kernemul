@@ -120,9 +120,23 @@ bool win_thread::try_satisfy(addr_space& space)
 	return true;
 }
 
+bool win_thread::complete_io(const NTSTATUS status)
+{
+	if (!wait_ || wait_->satisfied || !wait_->pending_io)
+		return false;
+
+	wait_->status = status;
+	wait_->satisfied = true;
+
+	if (const auto p = proc(); p && p->scheduler())
+		p->scheduler()->wake();
+
+	return true;
+}
+
 void win_thread::alert()
 {
-	if (wait_ && !wait_->satisfied && wait_->objects.empty())
+	if (wait_ && !wait_->satisfied && wait_->objects.empty() && !wait_->pending_io)
 	{
 		wait_->status = STATUS_SUCCESS;
 		wait_->satisfied = true;
@@ -218,7 +232,7 @@ bool win_thread::is_ready(vcpu& cpu)
 
 		if (remaining <= 0)
 		{
-			finish(STATUS_TIMEOUT);
+			finish(wait_->timeout_status);
 			return true;
 		}
 

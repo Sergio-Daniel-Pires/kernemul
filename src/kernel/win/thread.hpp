@@ -7,6 +7,8 @@
 #include "user_setup.hpp"
 
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -41,9 +43,20 @@ public:
 		// Filled in by whoever satisfied the wait; reading the objects is the signaller's job.
 		bool satisfied = false;
 		NTSTATUS status = 0;
+
+		bool pending_io = false;
+
+		NTSTATUS timeout_status = STATUS_TIMEOUT;
 	};
 
 	void begin_wait(wait_state w);
+
+	bool complete_io(NTSTATUS status);
+
+	[[nodiscard]] bool io_pending() const noexcept
+	{
+		return wait_ && !wait_->satisfied && wait_->pending_io;
+	}
 
 	[[nodiscard]] bool is_waiting() const { return wait_.has_value(); }
 	[[nodiscard]] bool waiting_on(const addr_t object) const
@@ -95,6 +108,18 @@ public:
 	[[nodiscard]] const emu_object<_TEB64>& teb() const { return teb_; }
 	[[nodiscard]] bool is_system_thread() const { return !teb_; }
 
+	[[nodiscard]] std::shared_ptr<win_object> impersonation_token() const
+	{
+		std::scoped_lock lock(token_mtx_);
+		return impersonation_token_;
+	}
+
+	void set_impersonation_token(std::shared_ptr<win_object> token)
+	{
+		std::scoped_lock lock(token_mtx_);
+		impersonation_token_ = std::move(token);
+	}
+
 	[[nodiscard]] bool is_user_mode() const override { return !is_system_thread(); }
 
 protected:
@@ -107,6 +132,9 @@ protected:
 	emu_object<_TEB64> teb_;
 	emu_object<_ETHREAD> ethread_;
 	windows_emulator* emulator_ = nullptr;
+
+	mutable std::mutex token_mtx_;
+	std::shared_ptr<win_object> impersonation_token_;
 };
 
 class win_user_thread : public win_thread
