@@ -1,6 +1,7 @@
 #include "nt_dispatch_ops.hpp"
 #include "../win_kernel.hpp"
 #include "../dispatcher.hpp"
+#include "../object_names.hpp"
 #include "../objects.hpp"
 #include "../thread.hpp"
 #include "../status.hpp"
@@ -21,29 +22,139 @@ constexpr std::uint32_t notification_event = 0;
 
 constexpr std::uint32_t event_basic_information = 0;
 
+constexpr std::uint32_t semaphore_basic_information = 0;
+constexpr std::uint32_t mutant_basic_information = 0;
+constexpr std::uint32_t mutant_owner_information = 1;
+
 #pragma pack(push, 4)
 struct event_basic_information_t
 {
 	std::uint32_t event_type;
 	std::int32_t  event_state;
 };
+
+struct semaphore_basic_information_t
+{
+	std::int32_t current_count;
+	std::int32_t maximum_count;
+};
+
+struct mutant_basic_information_t
+{
+	std::int32_t current_count;
+	std::uint8_t owned_by_caller;
+	std::uint8_t abandoned_state;
+	std::uint16_t padding;
+};
 #pragma pack(pop)
 
-template <typename T>
-std::uint64_t create_dispatcher(win_kernel_state& state, const win::dispatcher_type type,
-	const std::int32_t signal_state, const std::uint32_t access, std::string name)
+win::dispatcher_type kind_of(const win::dispatcher_type type)
 {
+	return type == win::event_synchronization_object ? win::event_notification_object : type;
+}
+
+struct created
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	std::uint64_t handle = 0;
+	addr_t address = 0;
+
+	bool existed() const { return status == STATUS_OBJECT_NAME_EXISTS; }
+};
+
+created open_named(win_kernel_state& state, const resolved_object_name& name,
+	const addr_t existing, const win::dispatcher_type type, const std::uint32_t access)
+{
+	const auto host = state.objs.get_object<dispatcher_host>(existing);
+
+	if (!host || kind_of(host->type) != kind_of(type))
+		return { STATUS_OBJECT_TYPE_MISMATCH };
+
+	const auto handle = state.sys_proc->handle_table().create_handle(existing, access,
+		(name.attributes & obj_inherit) ? win_handle_table::flag_inherit : 0);
+
+	if (!handle)
+		return { STATUS_INSUFFICIENT_RESOURCES };
+
+	return { STATUS_SUCCESS, handle, existing };
+}
+
+template <typename T>
+created create_dispatcher(win_kernel_state& state, vcpu& cpu,
+	const emu_object<_OBJECT_ATTRIBUTES>& object_attributes, const win::dispatcher_type type,
+	const std::int32_t signal_state, const std::uint32_t access)
+{
+	const auto name = resolve_object_name(state, cpu, object_attributes);
+
+	if (name.status != STATUS_SUCCESS)
+		return { name.status };
+
+	if (name.named())
+	{
+		if (const auto existing = state.objs.lookup_named_object(name.key))
+		{
+			if (!(name.attributes & obj_openif))
+				return { STATUS_OBJECT_NAME_COLLISION };
+
+			auto made = open_named(state, name, existing, type, access);
+
+			if (made.status == STATUS_SUCCESS)
+				made.status = STATUS_OBJECT_NAME_EXISTS;
+
+			return made;
+		}
+	}
+
 	const T zeroed{};
 	const auto addr = state.objs.create_object(0, &zeroed, sizeof(T),
-		std::make_shared<dispatcher_host>(type, std::move(name)), prot_rw | prot_supervisor);
+		std::make_shared<dispatcher_host>(type, name.name), prot_rw | prot_supervisor);
 
 	if (!addr)
-		return 0;
+		return { STATUS_INSUFFICIENT_RESOURCES };
 
 	emu_object<T> obj(*state.emulator()->emu().default_addr_space(), addr);
 	win::init_dispatcher(obj, type, signal_state);
 
-	return state.sys_proc->handle_table().create_handle(addr, access);
+	if (name.named())
+		state.objs.register_named_object(name.key, addr);
+
+	const auto handle = state.sys_proc->handle_table().create_handle(addr, access,
+		(name.attributes & obj_inherit) ? win_handle_table::flag_inherit : 0);
+
+	if (!handle)
+		return { STATUS_INSUFFICIENT_RESOURCES };
+
+	return { STATUS_SUCCESS, handle, addr };
+}
+
+NTSTATUS open_dispatcher(win_kernel_state& state, vcpu& cpu, emu_object<std::uint64_t> out,
+	const std::uint32_t access, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes,
+	const win::dispatcher_type type)
+{
+	if (!out)
+		return STATUS_INVALID_PARAMETER;
+
+	out.write(0);
+
+	const auto name = resolve_object_name(state, cpu, object_attributes);
+
+	if (name.status != STATUS_SUCCESS)
+		return name.status;
+
+	if (!name.named())
+		return STATUS_OBJECT_PATH_SYNTAX_BAD;
+
+	const auto existing = state.objs.lookup_named_object(name.key);
+
+	if (!existing)
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+
+	const auto opened = open_named(state, name, existing, type, access);
+
+	if (opened.status == STATUS_SUCCESS)
+		out.write(opened.handle);
+
+	return opened.status;
 }
 
 struct resolved
@@ -156,37 +267,30 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		if (!event_handle)
 			return STATUS_INVALID_PARAMETER;
 
-		const auto name = attribute_name(cpu, object_attributes);
 		const auto type = event_type == notification_event
 			? win::event_notification_object : win::event_synchronization_object;
 
-		const auto handle = create_dispatcher<_KEVENT>(*st, type, initial_state ? 1 : 0,
-			desired_access, name);
+		const auto made = create_dispatcher<_KEVENT>(*st, cpu, object_attributes, type,
+			initial_state ? 1 : 0, desired_access);
 
-		if (!handle)
-			return STATUS_INSUFFICIENT_RESOURCES;
+		if (!made.handle)
+			return made.status;
 
-		event_handle.write(handle);
+		event_handle.write(made.handle);
 
-		THREAD_LOG_INFO("NtCreateEvent('{}', {}, state={}) -> handle=0x{:X}",
-			name, event_type == notification_event ? "notification" : "synchronization",
-			initial_state, handle);
+		THREAD_LOG_INFO("NtCreateEvent({}, state={}) -> handle=0x{:X}",
+			event_type == notification_event ? "notification" : "synchronization",
+			initial_state, made.handle);
 
-		return STATUS_SUCCESS;
+		return made.status;
 	};
 
-	// Nothing puts an event in a namespace, so there is never one to open by name.
 	state.redirect_ntzw(mod, "OpenEvent",
-		[](vcpu& cpu, emu_object<std::uint64_t> event_handle, const std::uint32_t desired_access,
+		[st](vcpu& cpu, emu_object<std::uint64_t> event_handle, const std::uint32_t desired_access,
 			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
 		{
-			if (event_handle)
-				event_handle.write(0);
-
-			THREAD_LOG_WARN("NtOpenEvent('{}', access=0x{:X}): nothing here names an event",
-				attribute_name(cpu, object_attributes), desired_access);
-
-			return STATUS_OBJECT_NAME_NOT_FOUND;
+			return open_dispatcher(*st, cpu, std::move(event_handle), desired_access,
+				object_attributes, win::event_notification_object);
 		});
 
 	auto set_event = [st](vcpu& cpu, const std::uint64_t event_handle,
@@ -297,24 +401,23 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		if (maximum_count <= 0 || initial_count < 0 || initial_count > maximum_count)
 			return STATUS_INVALID_PARAMETER;
 
-		const auto name = attribute_name(cpu, object_attributes);
-		const auto handle = create_dispatcher<_KSEMAPHORE>(*st, win::semaphore_object,
-			initial_count, desired_access, name);
+		const auto made = create_dispatcher<_KSEMAPHORE>(*st, cpu, object_attributes,
+			win::semaphore_object, initial_count, desired_access);
 
-		if (!handle)
-			return STATUS_INSUFFICIENT_RESOURCES;
+		if (!made.handle)
+			return made.status;
 
 		// The limit lives past the dispatcher header, and KeReleaseSemaphore checks against it.
-		const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
-		emu_object<_KSEMAPHORE>(*cpu.curr_addr_space(), entry->body_addr)
-			.field(&_KSEMAPHORE::Limit).write(maximum_count);
+		if (!made.existed())
+			emu_object<_KSEMAPHORE>(*cpu.curr_addr_space(), made.address)
+				.field(&_KSEMAPHORE::Limit).write(maximum_count);
 
-		semaphore_handle.write(handle);
+		semaphore_handle.write(made.handle);
 
-		THREAD_LOG_INFO("NtCreateSemaphore('{}', initial={}, maximum={}) -> handle=0x{:X}",
-			name, initial_count, maximum_count, handle);
+		THREAD_LOG_INFO("NtCreateSemaphore(initial={}, maximum={}) -> handle=0x{:X}",
+			initial_count, maximum_count, made.handle);
 
-		return STATUS_SUCCESS;
+		return made.status;
 	};
 
 	auto release_semaphore = [st](vcpu& cpu, const std::uint64_t semaphore_handle,
@@ -363,30 +466,28 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		if (!mutant_handle)
 			return STATUS_INVALID_PARAMETER;
 
-		const auto name = attribute_name(cpu, object_attributes);
-		const auto handle = create_dispatcher<_KMUTANT>(*st, win::mutant_object,
-			initial_owner ? 0 : 1, desired_access, name);
+		const auto made = create_dispatcher<_KMUTANT>(*st, cpu, object_attributes,
+			win::mutant_object, initial_owner ? 0 : 1, desired_access);
 
-		if (!handle)
-			return STATUS_INSUFFICIENT_RESOURCES;
+		if (!made.handle)
+			return made.status;
 
-		if (initial_owner)
+		if (initial_owner && !made.existed())
 		{
-			const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
 			const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 			const auto ethread = t ? t->ethread().address() : 0;
 
-			emu_object<_KMUTANT>(*cpu.curr_addr_space(), entry->body_addr)
+			emu_object<_KMUTANT>(*cpu.curr_addr_space(), made.address)
 				.field(&_KMUTANT::OwnerThread)
 				.write(guest_ptr<_KTHREAD>(ethread));
 		}
 
-		mutant_handle.write(handle);
+		mutant_handle.write(made.handle);
 
-		THREAD_LOG_INFO("NtCreateMutant('{}', initial_owner={}) -> handle=0x{:X}",
-			name, initial_owner, handle);
+		THREAD_LOG_INFO("NtCreateMutant(initial_owner={}) -> handle=0x{:X}", initial_owner,
+			made.handle);
 
-		return STATUS_SUCCESS;
+		return made.status;
 	};
 
 	auto release_mutant = [st](vcpu& cpu, const std::uint64_t mutant_handle,
@@ -431,6 +532,119 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 	state.redirect_ntzw(mod, "ReleaseSemaphore", release_semaphore);
 	state.redirect_ntzw(mod, "CreateMutant", create_mutant);
 	state.redirect_ntzw(mod, "ReleaseMutant", release_mutant);
+
+	state.redirect_ntzw(mod, "OpenSemaphore",
+		[st](vcpu& cpu, emu_object<std::uint64_t> semaphore_handle,
+			const std::uint32_t desired_access,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
+		{
+			return open_dispatcher(*st, cpu, std::move(semaphore_handle), desired_access,
+				object_attributes, win::semaphore_object);
+		});
+
+	state.redirect_ntzw(mod, "OpenMutant",
+		[st](vcpu& cpu, emu_object<std::uint64_t> mutant_handle,
+			const std::uint32_t desired_access,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
+		{
+			return open_dispatcher(*st, cpu, std::move(mutant_handle), desired_access,
+				object_attributes, win::mutant_object);
+		});
+
+	state.redirect_ntzw(mod, "QuerySemaphore",
+		[st](vcpu& cpu, const std::uint64_t semaphore_handle,
+			const std::uint32_t semaphore_information_class, const addr_t semaphore_information,
+			const std::uint32_t length, emu_object<std::uint32_t> return_length) -> NTSTATUS
+		{
+			const auto found = resolve(*st, semaphore_handle, win::semaphore_object,
+				"NtQuerySemaphore");
+
+			if (!found.address)
+				return STATUS_INVALID_HANDLE;
+
+			if (semaphore_information_class != semaphore_basic_information)
+				return STATUS_INVALID_INFO_CLASS;
+
+			if (length < sizeof(semaphore_basic_information_t))
+				return STATUS_INFO_LENGTH_MISMATCH;
+
+			auto& space = *cpu.curr_addr_space();
+			const emu_object<_KSEMAPHORE> semaphore(space, found.address);
+
+			semaphore_basic_information_t info{};
+			info.current_count = win::signal_state(semaphore);
+			info.maximum_count = semaphore.field(&_KSEMAPHORE::Limit).read();
+
+			emu_object<semaphore_basic_information_t>(space, semaphore_information).write(info);
+
+			if (return_length)
+				return_length.write(sizeof(info));
+
+			return STATUS_SUCCESS;
+		});
+
+	state.redirect_ntzw(mod, "QueryMutant",
+		[st](vcpu& cpu, const std::uint64_t mutant_handle,
+			const std::uint32_t mutant_information_class, const addr_t mutant_information,
+			const std::uint32_t length, emu_object<std::uint32_t> return_length) -> NTSTATUS
+		{
+			const auto found = resolve(*st, mutant_handle, win::mutant_object, "NtQueryMutant");
+
+			if (!found.address)
+				return STATUS_INVALID_HANDLE;
+
+			auto& space = *cpu.curr_addr_space();
+			const emu_object<_KMUTANT> mutant(space, found.address);
+
+			const auto owner = guest_va(mutant.field(&_KMUTANT::OwnerThread).read());
+
+			switch (mutant_information_class)
+			{
+			case mutant_basic_information:
+			{
+				if (length < sizeof(mutant_basic_information_t))
+					return STATUS_INFO_LENGTH_MISMATCH;
+
+				const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+
+				mutant_basic_information_t info{};
+				info.current_count = win::signal_state(mutant);
+				info.owned_by_caller = owner && t && t->ethread().address() == owner;
+				info.abandoned_state = mutant.field(&_KMUTANT::MutantFlags).read() & 1;
+
+				emu_object<mutant_basic_information_t>(space, mutant_information).write(info);
+
+				if (return_length)
+					return_length.write(sizeof(info));
+
+				return STATUS_SUCCESS;
+			}
+
+			case mutant_owner_information:
+			{
+				if (length < sizeof(_CLIENT_ID))
+					return STATUS_INFO_LENGTH_MISMATCH;
+
+				if (!owner)
+					return STATUS_INVALID_PARAMETER;
+
+				const auto t = st->find_ethread(emu_object<_ETHREAD>(space, owner));
+
+				if (!t)
+					return STATUS_INVALID_PARAMETER;
+
+				emu_object<_CLIENT_ID>(space, mutant_information).write(t->client_id().read());
+
+				if (return_length)
+					return_length.write(sizeof(_CLIENT_ID));
+
+				return STATUS_SUCCESS;
+			}
+
+			default:
+				return STATUS_INVALID_INFO_CLASS;
+			}
+		});
 
 	auto default_keyed_event = std::make_shared<keyed_event_host>();
 

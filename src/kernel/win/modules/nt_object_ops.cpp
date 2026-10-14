@@ -1,21 +1,113 @@
 #include "nt_object_ops.hpp"
 #include "../win_kernel.hpp"
+#include "../object_names.hpp"
+#include "../file_common.hpp"
 #include "../objects.hpp"
+#include "../pipe.hpp"
 #include "../status.hpp"
 #include "../process_params.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
 #include "../../../util/string.hpp"
 #include "../../../util/log.hpp"
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace
 {
 
 constexpr std::size_t namespace_object_body_size = 0x10;
 
-struct directory_host final : win_object {};
+enum object_information_class : std::uint32_t
+{
+	object_basic_information       = 0,
+	object_name_information        = 1,
+	object_type_information        = 2,
+	object_types_information       = 3,
+	object_handle_flag_information = 4,
+};
+
+struct object_kind
+{
+	std::string type;
+	std::string name;
+	std::uint32_t valid_access = 0;
+};
+
+template <typename T>
+void put(std::vector<std::uint8_t>& out, const std::size_t offset, const T value)
+{
+	std::memcpy(out.data() + offset, &value, sizeof(T));
+}
+
+std::optional<object_kind> describe_object(win_kernel_state& state, const addr_t body)
+{
+	if (const auto file = state.objs.get_object<file_host>(body))
+	{
+		auto path = file->path;
+		std::ranges::replace(path, '/', '\\');
+
+		if (!file->is_device())
+		{
+			if (path.size() >= 2 && path[1] == ':')
+				path.erase(0, 2);
+
+			if (path.empty() || path.front() != '\\')
+				path.insert(path.begin(), '\\');
+
+			path = "\\Device\\HarddiskVolume3" + path;
+		}
+
+		return object_kind{ "File", file->console ? std::string() : path, 0x1F01FF };
+	}
+
+	if (const auto dispatcher = state.objs.get_object<dispatcher_host>(body))
+	{
+		switch (dispatcher->type)
+		{
+		case win::event_notification_object:
+		case win::event_synchronization_object:
+			return object_kind{ "Event", dispatcher->name, 0x1F0003 };
+
+		case win::mutant_object:
+			return object_kind{ "Mutant", dispatcher->name, 0x1F0001 };
+
+		case win::semaphore_object:
+			return object_kind{ "Semaphore", dispatcher->name, 0x1F0003 };
+
+		case win::timer_notification_object:
+		case win::timer_synchronization_object:
+			return object_kind{ "Timer", dispatcher->name, 0x1F0003 };
+
+		default:
+			return std::nullopt;
+		}
+	}
+
+	if (const auto directory = state.objs.get_object<directory_host>(body))
+		return object_kind{ "Directory", directory->name, 0xF000F };
+
+	if (state.objs.get_object<symbolic_link_host>(body))
+		return object_kind{ "SymbolicLink", {}, 0xF0001 };
+
+	if (state.objs.get_object<section_host>(body))
+		return object_kind{ "Section", {}, 0xF001F };
+
+	if (state.objs.get_object<thread_object>(body))
+		return object_kind{ "Thread", {}, 0x1FFFFF };
+
+	if (state.objs.get_object<process_object>(body))
+		return object_kind{ "Process", {}, 0x1FFFFF };
+
+	if (state.objs.get_object<win::sec::token_host>(body))
+		return object_kind{ "Token", {}, 0xF01FF };
+
+	return std::nullopt;
+}
 
 // WDK types the kernel does not store, so not in the PDB; both are the same on each architecture.
 #pragma pack(push, 8)
@@ -111,6 +203,17 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 	{
 		THREAD_LOG_INFO("NtClose(handle=0x{:X})", handle);
 
+		const auto entry = sys_proc->handle_table().lookup_handle(handle);
+
+		if (entry && (entry->flags & win_handle_table::flag_protect_from_close))
+		{
+			THREAD_LOG_WARN("NtClose: handle 0x{:X} is protected from close", handle);
+			return STATUS_HANDLE_NOT_CLOSABLE;
+		}
+
+		const auto counts = entry ? st->objs.counts_of(entry->body_addr) : std::nullopt;
+		const bool last_handle = counts && counts->handles == 1;
+
 		// The last handle on a device is what tells its driver the open is over, so the two
 		// requests real cleanup sends go out before the handle stops naming anything.
 		if (const auto host = sys_proc->handle_table().get_object<file_host>(handle);
@@ -135,6 +238,22 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 		{
 			THREAD_LOG_WARN("NtClose: invalid handle 0x{:X}", handle);
 			return STATUS_INVALID_HANDLE;
+		}
+
+		if (!last_handle)
+			return STATUS_SUCCESS;
+
+		if (const auto pipe = st->objs.get_object<pipe_host>(entry->body_addr))
+		{
+			st->pipes->close_end(cpu, *pipe);
+		}
+		else if (const auto host = st->objs.get_object<file_host>(entry->body_addr);
+			host && host->file)
+		{
+			std::erase_if(host->file->locks, [&](const auto& lock) { return lock.owner == host.get(); });
+
+			if (host->delete_on_close)
+				delete_host(*st, *host);
 		}
 
 		return STATUS_SUCCESS;
@@ -314,16 +433,24 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 	};
 
 	state.redirect_ntzw(mod, "OpenDirectoryObject",
-		[attribute_name, open_namespace_object](vcpu& cpu,
+		[st = &state, open_namespace_object](vcpu& cpu,
 			emu_object<std::uint64_t> directory_handle, const std::uint32_t desired_access,
 			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
 		{
 			if (!directory_handle)
 				return STATUS_INVALID_PARAMETER;
 
-			const auto name = attribute_name(cpu, object_attributes);
-			const auto handle = open_namespace_object(std::make_shared<directory_host>(),
-				name, desired_access);
+			const auto resolved = resolve_object_name(*st, cpu, object_attributes);
+
+			if (resolved.status != STATUS_SUCCESS)
+				return resolved.status;
+
+			const auto& name = resolved.name;
+
+			auto host = std::make_shared<directory_host>();
+			host->name = name;
+
+			const auto handle = open_namespace_object(std::move(host), name, desired_access);
 
 			if (!handle)
 				return STATUS_INSUFFICIENT_RESOURCES;
@@ -422,6 +549,132 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 			link_target.write(value);
 
 			THREAD_LOG_INFO("NtQuerySymbolicLinkObject(0x{:X}) -> '{}'", link_handle, host->target);
+
+			return STATUS_SUCCESS;
+		});
+
+	state.redirect_ntzw(mod, "QueryObject",
+		[st = &state](vcpu& cpu, const std::uint64_t handle, const std::uint32_t information_class,
+			const addr_t object_information, const std::uint32_t length,
+			emu_object<std::uint32_t> return_length) -> NTSTATUS
+		{
+			if (information_class == object_types_information)
+				return STATUS_NOT_IMPLEMENTED;
+
+			if (information_class > object_handle_flag_information)
+				return STATUS_INVALID_INFO_CLASS;
+
+			std::optional<object_kind> kind;
+			addr_t body = 0;
+			std::uint32_t access = 0x1FFFFF;
+			std::uint8_t flags = 0;
+
+			if (handle == ~std::uint64_t{0} || handle == ~std::uint64_t{1})
+			{
+				kind = object_kind{ handle == ~std::uint64_t{0} ? "Process" : "Thread", {}, 0x1FFFFF };
+			}
+			else
+			{
+				const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+
+				if (!entry)
+					return STATUS_INVALID_HANDLE;
+
+				body = entry->body_addr;
+				access = entry->access;
+				flags = entry->flags;
+				kind = describe_object(*st, body);
+			}
+
+			const auto name = kind ? kind->name : std::string();
+			const auto type = kind ? kind->type : std::string();
+			const auto wide = widen_string(information_class == object_type_information ? type : name);
+
+			constexpr std::size_t type_header = 0x68;
+			const std::size_t string_bytes = wide.size() * sizeof(char16_t);
+
+			std::size_t needed = 0x38;
+
+			if (information_class == object_name_information)
+				needed = 16 + (string_bytes ? string_bytes + sizeof(char16_t) : 0);
+			else if (information_class == object_type_information)
+				needed = type_header + string_bytes + sizeof(char16_t);
+			else if (information_class == object_handle_flag_information)
+				needed = 2;
+
+			if (return_length)
+				return_length.write(static_cast<std::uint32_t>(needed));
+
+			if (information_class == object_type_information && !kind)
+				return STATUS_NOT_IMPLEMENTED;
+
+			if (length < needed)
+				return STATUS_INFO_LENGTH_MISMATCH;
+
+			std::vector<std::uint8_t> out(needed);
+
+			const auto put_string = [&](const std::size_t at)
+			{
+				put<std::uint16_t>(out, 0, static_cast<std::uint16_t>(string_bytes));
+				put<std::uint16_t>(out, 2, static_cast<std::uint16_t>(string_bytes + sizeof(char16_t)));
+				put<std::uint64_t>(out, 8, object_information + at);
+				std::memcpy(out.data() + at, wide.data(), string_bytes);
+			};
+
+			if (information_class == object_basic_information)
+			{
+				const auto counts = st->objs.counts_of(body);
+
+				put<std::uint32_t>(out, 0, (flags & win_handle_table::flag_inherit) ? 0x2 : 0);
+				put<std::uint32_t>(out, 4, access);
+				put<std::uint32_t>(out, 8, counts ? static_cast<std::uint32_t>(counts->handles) : 1);
+				put<std::uint32_t>(out, 12, counts ? static_cast<std::uint32_t>(counts->pointers) : 1);
+				put<std::uint32_t>(out, 0x20, static_cast<std::uint32_t>(
+					16 + (name.empty() ? 0 : (name.size() + 1) * sizeof(char16_t))));
+				put<std::uint32_t>(out, 0x24, static_cast<std::uint32_t>(
+					type_header + (type.size() + 1) * sizeof(char16_t)));
+			}
+			else if (information_class == object_name_information)
+			{
+				if (string_bytes)
+					put_string(16);
+			}
+			else if (information_class == object_type_information)
+			{
+				put_string(type_header);
+				put<std::uint32_t>(out, 0x54, kind->valid_access);
+			}
+			else
+			{
+				out[0] = (flags & win_handle_table::flag_inherit) != 0;
+				out[1] = (flags & win_handle_table::flag_protect_from_close) != 0;
+			}
+
+			cpu.curr_addr_space()->write_mem(object_information, out.data(), out.size());
+
+			return STATUS_SUCCESS;
+		});
+
+	state.redirect_ntzw(mod, "SetInformationObject",
+		[st = &state](vcpu& cpu, const std::uint64_t handle, const std::uint32_t information_class,
+			const addr_t object_information, const std::uint32_t length) -> NTSTATUS
+		{
+			if (information_class != object_handle_flag_information)
+				return STATUS_INVALID_INFO_CLASS;
+
+			if (length < 2)
+				return STATUS_INFO_LENGTH_MISMATCH;
+
+			if (!st->sys_proc->handle_table().lookup_handle(handle))
+				return STATUS_INVALID_HANDLE;
+
+			auto& space = *cpu.curr_addr_space();
+
+			const std::uint8_t flags =
+				(space.read_mem<std::uint8_t>(object_information) ? win_handle_table::flag_inherit : 0)
+				| (space.read_mem<std::uint8_t>(object_information + 1) ? win_handle_table::flag_protect_from_close : 0);
+
+			st->sys_proc->handle_table().set_handle_flags(handle, flags);
 
 			return STATUS_SUCCESS;
 		});
