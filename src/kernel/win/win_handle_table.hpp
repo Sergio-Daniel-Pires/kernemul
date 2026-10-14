@@ -12,17 +12,23 @@ public:
 	using handle_t = std::uint64_t;
 	using access_t = std::uint32_t;
 
+	static constexpr std::uint8_t flag_inherit = 0x1;
+	static constexpr std::uint8_t flag_protect_from_close = 0x2;
+
 	struct handle_entry
 	{
 		addr_t body_addr;
 		access_t access;
+		std::uint8_t flags = 0;
 	};
 
 	explicit win_handle_table(win_obj_manager& objs);
 
-	handle_t create_handle(addr_t body_addr, access_t access);
+	handle_t create_handle(addr_t body_addr, access_t access, std::uint8_t flags = 0);
 	bool close_handle(handle_t handle);
 	[[nodiscard]] std::optional<handle_entry> lookup_handle(handle_t handle) const;
+
+	bool set_handle_flags(handle_t handle, std::uint8_t flags);
 	[[nodiscard]] win_obj_manager& objs() { return objs_; }
 
 	template <typename T>

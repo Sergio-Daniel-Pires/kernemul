@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,6 +68,14 @@ public:
 	void dereference_object(addr_t body_addr);
 	void increment_handle_count(addr_t body_addr);
 	void decrement_handle_count(addr_t body_addr);
+
+	struct counts
+	{
+		std::int64_t pointers = 0;
+		std::int64_t handles = 0;
+	};
+
+	[[nodiscard]] std::optional<counts> counts_of(addr_t body_addr) const;
 
 	using id_type = std::uint32_t;
 

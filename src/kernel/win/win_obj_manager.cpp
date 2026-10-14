@@ -103,6 +103,19 @@ void win_obj_manager::decrement_handle_count(addr_t body_addr)
 	it->second.header.write(hdr);
 }
 
+std::optional<win_obj_manager::counts> win_obj_manager::counts_of(const addr_t body_addr) const
+{
+	std::scoped_lock lock(mtx_);
+	const auto it = objects_.find(body_addr);
+
+	if (it == objects_.end() || !it->second.header)
+		return std::nullopt;
+
+	const auto hdr = it->second.header.read();
+
+	return counts{ hdr.PointerCount, hdr.HandleCount };
+}
+
 win_obj_manager::id_type win_obj_manager::allocate_id()
 {
 	const auto id = next_id_;
