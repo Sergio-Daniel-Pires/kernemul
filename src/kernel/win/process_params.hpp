@@ -52,7 +52,7 @@ inline std::u16string_view dir_from_path(std::u16string_view path)
 }
 
 inline emu_object<_RTL_USER_PROCESS_PARAMETERS> init_process_parameters(
-	win_user_mem& mem, std::u16string_view image_path)
+	win_user_mem& mem, std::u16string_view image_path, std::u16string_view cmd = {})
 {
 	const auto current_dir = dir_from_path(image_path);
 
@@ -80,7 +80,7 @@ inline emu_object<_RTL_USER_PROCESS_PARAMETERS> init_process_parameters(
 	const auto dos_path     = place(current_dir);
 	const auto dll_path     = place(system32_dir);
 	const auto image_name   = place(image_path);
-	const auto command_line = place(image_path);
+	const auto command_line = place(cmd.empty() ? image_path : cmd);
 
 	constexpr std::size_t strings_at = sizeof(_RTL_USER_PROCESS_PARAMETERS);
 	const auto total = strings_at + strings.size() * sizeof(char16_t);
