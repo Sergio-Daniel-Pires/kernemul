@@ -517,6 +517,64 @@ addr_t win_user_mem::alloc(const std::size_t size, const mem_prot prot)
 	return alloc_pages(size, to_win_prot(prot));
 }
 
+NTSTATUS win_user_mem::map_view(addr_t& base, std::size_t& size, const addr_t pa,
+	const std::uint32_t prot)
+{
+	std::scoped_lock lock(mtx_);
+
+	const auto region = size_align(size);
+
+	if (!region)
+		return STATUS_INVALID_PARAMETER;
+
+	const auto target = base ? base : pick_base(region, 0);
+
+	if (!target || target + region > win::user_addr_limit)
+		return STATUS_NO_MEMORY;
+
+	if (base && (base & (win::alloc_granularity - 1)))
+		return STATUS_MAPPED_ALIGNMENT;
+
+	if (overlapping(target, region) != reservations_.end())
+		return STATUS_CONFLICTING_ADDRESSES;
+
+	auto& res = reservations_[target];
+	res.size = region;
+	res.initial_prot = prot;
+	res.type = win::mem_mapped;
+	res.committed[target] = committed_region{ .size = region, .prot = prot };
+
+	space_->mmu_->map_virt_phys(*space_, target, pa, region, to_mem_prot(prot));
+
+	base = target;
+	size = region;
+
+	LOG_INFO("win_user_mem: mapped view 0x{:X}+0x{:X} of 0x{:X} (prot=0x{:X})",
+		target, region, pa, prot);
+
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS win_user_mem::unmap_view(const addr_t base, std::size_t& size)
+{
+	std::scoped_lock lock(mtx_);
+
+	// Any address inside the view names it, and the whole view goes.
+	const auto res = find_reservation(base);
+
+	if (res == reservations_.end() || res->second.type != win::mem_mapped)
+		return STATUS_NOT_MAPPED_VIEW;
+
+	size = res->second.size;
+
+	for (const auto& [sub_base, sub] : res->second.committed)
+		release_pages(sub_base, sub.size);
+
+	reservations_.erase(res);
+
+	return STATUS_SUCCESS;
+}
+
 void win_user_mem::register_image(const addr_t base, const std::size_t size)
 {
 	std::scoped_lock lock(mtx_);

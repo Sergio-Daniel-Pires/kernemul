@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -89,9 +90,17 @@ struct section_host final : win_object
 	std::uint64_t size = 0;
 	bool is_image = false;
 
+	// SectionPageProtection from NtCreateSection: what a view may be mapped with.
+	std::uint32_t protection = 0x04;
+
 	// An image section's view is the file laid out at its virtual addresses, not the file as it
 	// sits on disk, so it is built once here and copied from. Empty for anything else.
 	std::vector<std::uint8_t> image;
+
+	// The pages every view of a data section maps, allocated when it is first mapped so that a
+	// write through one view is the same write through another.
+	addr_t phys = 0;
+	std::mutex phys_mtx;
 };
 
 struct dispatcher_host final : win_object

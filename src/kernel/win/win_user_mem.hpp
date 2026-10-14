@@ -83,6 +83,10 @@ public:
 	template <typename T>
 	void write_mem(addr_t va, const T& val) { space_->write_mem<T>(va, val); }
 
+	// Maps physical pages a section owns, so every process that maps it sees the same bytes.
+	NTSTATUS map_view(addr_t& base, std::size_t& size, addr_t pa, std::uint32_t prot);
+	NTSTATUS unmap_view(addr_t base, std::size_t& size);
+
 	void register_image(addr_t base, std::size_t size);
 	void register_mapped(addr_t base, std::size_t size, std::uint32_t prot);
 

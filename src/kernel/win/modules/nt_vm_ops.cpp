@@ -1,6 +1,7 @@
 #include "nt_vm_ops.hpp"
 #include "../win_kernel.hpp"
 #include "../mdl.hpp"
+#include "../object_names.hpp"
 #include "../objects.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
@@ -141,6 +142,180 @@ bool is_current_process(const std::uint64_t handle)
 	return handle == 0 || handle == current_process_handle;
 }
 
+constexpr std::uint32_t protection_modifiers = 0x100 | 0x200 | 0x400;
+
+bool valid_protection(const std::uint32_t protect)
+{
+	switch (protect & ~protection_modifiers)
+	{
+	case page_noaccess:
+	case page_readonly:
+	case page_readwrite:
+	case page_writecopy:
+	case page_execute:
+	case page_execute_read:
+	case page_execute_readwrite:
+	case page_execute_writecopy:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+struct page_rights
+{
+	bool read = false;
+	bool write = false;
+	bool exec = false;
+	bool copy_on_write = false;
+};
+
+page_rights rights_of(const std::uint32_t protect)
+{
+	switch (protect & ~protection_modifiers)
+	{
+	case page_readonly:          return { true, false, false, false };
+	case page_readwrite:         return { true, true, false, false };
+	case page_writecopy:         return { true, true, false, true };
+	case page_execute:           return { false, false, true, false };
+	case page_execute_read:      return { true, false, true, false };
+	case page_execute_readwrite: return { true, true, true, false };
+	case page_execute_writecopy: return { true, true, true, true };
+	default:                     return {};
+	}
+}
+
+// A view may ask for no more than the section was created to allow.
+bool view_fits_section(const std::uint32_t view, const std::uint32_t section)
+{
+	const auto v = rights_of(view);
+	const auto s = rights_of(section);
+
+	return (!v.read || s.read || s.exec) && (!v.write || s.write) && (!v.exec || s.exec);
+}
+
+constexpr std::uint32_t section_map_write = 0x0002;
+constexpr std::uint32_t section_map_read = 0x0004;
+constexpr std::uint32_t section_map_execute = 0x0008;
+
+// What the section handle has to grant for a view with this protection.
+std::uint32_t section_access_needed(const std::uint32_t view)
+{
+	const auto v = rights_of(view);
+	std::uint32_t needed = 0;
+
+	if (v.write && !v.copy_on_write)
+		needed |= section_map_write;
+
+	if (v.exec)
+		needed |= section_map_execute;
+
+	if (v.read && (!v.write || v.copy_on_write))
+		needed |= section_map_read;
+
+	return needed;
+}
+
+constexpr std::uint32_t process_vm_operation = 0x0008;
+constexpr std::uint32_t process_vm_read = 0x0010;
+constexpr std::uint32_t process_vm_write = 0x0020;
+constexpr std::uint32_t process_query_information = 0x0400;
+constexpr std::uint32_t process_query_limited_information = 0x1000;
+
+// The address space a process handle names. mem is null for a process that has no user memory
+// tracker, which is the kernel's own.
+struct vm_target
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	win_user_mem* mem = nullptr;
+	std::shared_ptr<addr_space> space;
+	std::shared_ptr<process> proc;
+	bool remote = false;
+};
+
+vm_target resolve_target(win_kernel_state& state, vcpu& cpu, const std::uint64_t handle,
+	const std::uint32_t any_of_access)
+{
+	vm_target target;
+
+	if (is_current_process(handle))
+	{
+		target.space = cpu.curr_addr_space();
+		target.mem = user_mem(cpu);
+
+		if (const auto t = cpu.thread())
+			target.proc = t->proc();
+
+		return target;
+	}
+
+	const auto entry = state.sys_proc->handle_table().lookup_handle(handle);
+
+	if (!entry)
+	{
+		target.status = STATUS_INVALID_HANDLE;
+		return target;
+	}
+
+	const auto object = state.objs.get_object<process_object>(entry->body_addr);
+
+	if (!object)
+	{
+		target.status = STATUS_OBJECT_TYPE_MISMATCH;
+		return target;
+	}
+
+	if (!(entry->access & any_of_access))
+	{
+		target.status = STATUS_ACCESS_DENIED;
+		return target;
+	}
+
+	target.proc = state.find_process(static_cast<process::id_type>(object->pid));
+	target.space = target.proc ? target.proc->addr_space() : nullptr;
+
+	if (!target.space)
+	{
+		target.status = STATUS_PROCESS_IS_TERMINATING;
+		return target;
+	}
+
+	if (const auto user = std::dynamic_pointer_cast<win_user_proc>(target.proc))
+		target.mem = &user->mem();
+
+	target.remote = true;
+
+	return target;
+}
+
+// Data section pages live in guest physical memory, so a view in each process is the same bytes.
+addr_t section_backing(vcpu& cpu, section_host& host)
+{
+	std::scoped_lock lock(host.phys_mtx);
+
+	if (host.phys)
+		return host.phys;
+
+	auto& mmu = *cpu.curr_addr_space()->mmu_;
+
+	const auto size = (host.size + mdl_page_size - 1) & ~static_cast<std::uint64_t>(mdl_page_size - 1);
+	const auto pa = mmu.alloc_phys(size, prot_rw);
+
+	if (host.file)
+	{
+		const auto data = host.file->data();
+		const auto copied = std::min<std::size_t>(size, data.size());
+
+		if (copied)
+			mmu.write_phys(pa, data.data(), copied);
+	}
+
+	host.phys = pa;
+
+	return pa;
+}
+
 }
 
 // The page tables behind these are the guest's own, so it faults exactly as on real hardware.
@@ -148,17 +323,18 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 {
 	auto* st = &state;
 
-	auto allocate = [](vcpu& cpu, const std::uint64_t process_handle,
+	auto allocate = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
 		const std::uint32_t allocation_type, const std::uint32_t protect,
 		const std::string_view who) -> NTSTATUS
 	{
-		if (!is_current_process(process_handle))
-		{
-			THREAD_LOG_WARN("{}: process handle 0x{:X} is not this process, and there is no "
-				"other address space", who, process_handle);
-			return STATUS_INVALID_HANDLE;
-		}
+		const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+		if (target.status != STATUS_SUCCESS)
+			return target.status;
+
+		if (!valid_protection(protect))
+			return STATUS_INVALID_PAGE_PROTECTION;
 
 		if (!base_address || !region_size)
 			return STATUS_INVALID_PARAMETER;
@@ -176,7 +352,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_INVALID_PARAMETER;
 
 		// The address space's own cursor hands out supervisor pages, which ring 3 cannot touch.
-		if (auto* const mem = user_mem(cpu))
+		if (auto* const mem = target.mem)
 		{
 			addr_t base = wanted;
 			auto region = static_cast<std::size_t>(size);
@@ -198,7 +374,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_SUCCESS;
 		}
 
-		auto& space = *cpu.curr_addr_space();
+		auto& space = *target.space;
 		addr_t addr = 0;
 
 		try
@@ -249,12 +425,14 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			protect, "NtAllocateVirtualMemoryEx");
 	};
 
-	auto free_vm = [](vcpu& cpu, const std::uint64_t process_handle,
+	auto free_vm = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
 		const std::uint32_t free_type) -> NTSTATUS
 	{
-		if (!is_current_process(process_handle))
-			return STATUS_INVALID_HANDLE;
+		const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+		if (target.status != STATUS_SUCCESS)
+			return target.status;
 
 		if (!base_address)
 			return STATUS_INVALID_PARAMETER;
@@ -262,7 +440,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const auto base = mdl_page_base(base_address.read());
 		auto size = region_size ? region_size.read() : 0;
 
-		if (auto* const mem = user_mem(cpu))
+		if (auto* const mem = target.mem)
 		{
 			addr_t start = base;
 			auto region = static_cast<std::size_t>(size);
@@ -291,7 +469,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		if (!size)
 			return STATUS_INVALID_PARAMETER;
 
-		auto& space = *cpu.curr_addr_space();
+		auto& space = *target.space;
 
 		try
 		{
@@ -311,12 +489,17 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		return STATUS_SUCCESS;
 	};
 
-	auto protect_vm = [](vcpu& cpu, const std::uint64_t process_handle,
+	auto protect_vm = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
 		const std::uint32_t new_protect, emu_object<std::uint32_t> old_protect) -> NTSTATUS
 	{
-		if (!is_current_process(process_handle))
-			return STATUS_INVALID_HANDLE;
+		const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+		if (target.status != STATUS_SUCCESS)
+			return target.status;
+
+		if (!valid_protection(new_protect))
+			return STATUS_INVALID_PAGE_PROTECTION;
 
 		if (!base_address || !region_size)
 			return STATUS_INVALID_PARAMETER;
@@ -326,7 +509,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const auto size = (region_size.read() + (requested - base) + mdl_page_size - 1)
 			& ~static_cast<std::uint64_t>(mdl_page_size - 1);
 
-		if (auto* const mem = user_mem(cpu))
+		if (auto* const mem = target.mem)
 		{
 			addr_t start = base;
 			auto region = static_cast<std::size_t>(size);
@@ -345,7 +528,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_SUCCESS;
 		}
 
-		auto& space = *cpu.curr_addr_space();
+		auto& space = *target.space;
 
 		// No protection can be read back out of the tables, so the caller is told a fresh page's.
 		if (old_protect)
@@ -371,13 +554,16 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 	};
 
 	// Reporting the real run would need a VAD tree, so the run here is the one page asked about.
-	auto query_vm = [](vcpu& cpu, const std::uint64_t process_handle, const addr_t base_address,
+	auto query_vm = [st](vcpu& cpu, const std::uint64_t process_handle, const addr_t base_address,
 		const std::uint32_t memory_information_class, const addr_t memory_information,
 		const std::uint64_t memory_information_length,
 		emu_object<std::uint64_t> return_length) -> NTSTATUS
 	{
-		if (!is_current_process(process_handle))
-			return STATUS_INVALID_HANDLE;
+		const auto target = resolve_target(*st, cpu, process_handle,
+			process_query_information | process_query_limited_information);
+
+		if (target.status != STATUS_SUCCESS)
+			return target.status;
 
 		if (memory_information_class == memory_working_set_ex_information)
 		{
@@ -392,6 +578,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				return STATUS_INFO_LENGTH_MISMATCH;
 
 			auto& space = *cpu.curr_addr_space();
+			auto& queried = *target.space;
 
 			for (std::uint64_t i = 0; i < count; ++i)
 			{
@@ -399,7 +586,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 				auto info = entry.read();
 				const auto page = mdl_page_base(info.virtual_address);
-				const auto pa = space.mmu_->virt_to_phys(space, page);
+				const auto pa = queried.mmu_->virt_to_phys(queried, page);
 
 				info.attributes = pa
 					? working_set_valid
@@ -423,9 +610,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			if (memory_information_length < sizeof(memory_image_information_t))
 				return STATUS_INFO_LENGTH_MISMATCH;
 
-			const auto t = cpu.thread();
-			const auto proc = t ? t->proc() : nullptr;
-			const auto mod = proc ? proc->find_module_by_addr(base_address) : nullptr;
+			const auto mod = target.proc ? target.proc->find_module_by_addr(base_address) : nullptr;
 
 			if (!mod)
 			{
@@ -474,7 +659,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 		auto& space = *cpu.curr_addr_space();
 
-		if (auto* const mem = user_mem(cpu))
+		if (auto* const mem = target.mem)
 		{
 			win::memory_basic_info info{};
 			const auto status = mem->query(base_address, info);
@@ -491,7 +676,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		}
 
 		const auto base = mdl_page_base(base_address);
-		const bool mapped = space.mmu_->virt_to_phys(space, base).has_value();
+		const bool mapped = target.space->mmu_->virt_to_phys(*target.space, base).has_value();
 
 		memory_basic_information_t info{};
 		info.base_address = base;
@@ -526,8 +711,36 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const auto name = narrow_wstring(win::read_unicode_string(name_obj));
 		const auto max_size = maximum_size ? maximum_size.read() : 0;
 
+		const auto resolved = resolve_object_name(*st, cpu, object_attributes);
+
+		if (resolved.status != STATUS_SUCCESS)
+			return resolved.status;
+
+		if (resolved.named())
+		{
+			if (const auto existing = st->objs.lookup_named_object(resolved.key))
+			{
+				if (!(resolved.attributes & obj_openif))
+					return STATUS_OBJECT_NAME_COLLISION;
+
+				if (!st->objs.get_object<section_host>(existing))
+					return STATUS_OBJECT_TYPE_MISMATCH;
+
+				section_handle.write(st->sys_proc->handle_table().create_handle(existing,
+					desired_access, (resolved.attributes & obj_inherit)
+						? win_handle_table::flag_inherit : 0));
+
+				return STATUS_OBJECT_NAME_EXISTS;
+			}
+		}
+
+		if (!valid_protection(section_page_protection)
+			|| (section_page_protection & ~protection_modifiers) == page_noaccess)
+			return STATUS_INVALID_PAGE_PROTECTION;
+
 		auto host = std::make_shared<section_host>();
 		host->is_image = (allocation_attributes & sec_image) != 0;
+		host->protection = section_page_protection & ~protection_modifiers;
 
 		if (file_handle)
 		{
@@ -540,15 +753,26 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			host->path = file->path;
 		}
 
-		if (host->file && host->file->size() == 0)
+		const auto file_size = host->file ? static_cast<std::uint64_t>(host->file->size()) : 0;
+
+		if (host->file && file_size == 0 && max_size <= 0)
 			return STATUS_MAPPED_FILE_SIZE_ZERO;
 
 		if (!host->file && max_size <= 0)
 			return STATUS_INVALID_PARAMETER;
 
+		// A section the file cannot grow into cannot be larger than the file.
+		if (host->file && !host->is_image && static_cast<std::uint64_t>(max_size) > file_size
+			&& !rights_of(host->protection).write)
+			return STATUS_SECTION_TOO_BIG;
+
+		const auto page_mask = static_cast<std::uint64_t>(mdl_page_size - 1);
+
 		host->size = host->file
-			? static_cast<std::uint64_t>(host->file->size())
-			: static_cast<std::uint64_t>(max_size);
+			? (max_size > 0 && !host->is_image
+				? (static_cast<std::uint64_t>(max_size) + page_mask) & ~page_mask
+				: file_size)
+			: (static_cast<std::uint64_t>(max_size) + page_mask) & ~page_mask;
 
 		const auto size = static_cast<std::int64_t>(host->size);
 		const auto path = host->path;
@@ -562,7 +786,11 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		if (!addr)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
+		if (resolved.named())
+			st->objs.register_named_object(resolved.key, addr);
+
+		const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access,
+			(resolved.attributes & obj_inherit) ? win_handle_table::flag_inherit : 0);
 		section_handle.write(handle);
 
 		THREAD_LOG_INFO("NtCreateSection('{}', file=0x{:X}, max_size={}, protection=0x{:X}, "
@@ -587,6 +815,31 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			: 0);
 
 		const auto name = narrow_wstring(win::read_unicode_string(name_obj));
+
+		const auto resolved = resolve_object_name(*st, cpu, object_attributes);
+
+		if (resolved.status != STATUS_SUCCESS)
+			return resolved.status;
+
+		if (resolved.named())
+		{
+			if (const auto existing = st->objs.lookup_named_object(resolved.key))
+			{
+				if (!st->objs.get_object<section_host>(existing))
+					return STATUS_OBJECT_TYPE_MISMATCH;
+
+				const auto handle = st->sys_proc->handle_table().create_handle(existing,
+					desired_access, (resolved.attributes & obj_inherit)
+						? win_handle_table::flag_inherit : 0);
+
+				if (section_handle)
+					section_handle.write(handle);
+
+				THREAD_LOG_INFO("NtOpenSection('{}') -> handle=0x{:X}", name, handle);
+
+				return STATUS_SUCCESS;
+			}
+		}
 
 		if (name == shared_section_name)
 		{
@@ -657,7 +910,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		return STATUS_SUCCESS;
 	};
 
-	// A view is a copy of the section, not a shared mapping of the file behind it.
+	// A data view is the section's own pages; an image view is a copy laid out at its addresses.
 	state.redirect_ntzw(mod, "MapViewOfSection",
 		[st](vcpu& cpu, const std::uint64_t section_handle, const std::uint64_t process_handle,
 			emu_object<addr_t> base_address, [[maybe_unused]] const std::uint64_t zero_bits,
@@ -666,16 +919,24 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			const std::uint32_t inherit_disposition, const std::uint32_t allocation_type,
 			const std::uint32_t win32_protect) -> NTSTATUS
 		{
-			if (!is_current_process(process_handle))
-				return STATUS_INVALID_HANDLE;
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
 
 			const auto host = st->sys_proc->handle_table().get_object<section_host>(section_handle);
 
 			if (!host)
 				return STATUS_INVALID_HANDLE;
 
-			const auto offset = section_offset
+			const bool shared = !host->is_image && target.mem;
+
+			// The offset a view starts at is rounded down to the allocation granularity.
+			auto offset = section_offset
 				? static_cast<std::uint64_t>(section_offset.read()) : 0;
+
+			if (shared)
+				offset &= ~static_cast<std::uint64_t>(win::alloc_granularity - 1);
 
 			if (offset >= host->size)
 				return STATUS_INVALID_PARAMETER;
@@ -687,7 +948,55 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 			size = std::min<std::uint64_t>(size, host->size - offset);
 
-			auto& space = *cpu.curr_addr_space();
+			// A data view maps the section's own pages, so the process that made the section
+			// and the one it is mapped into read and write the same bytes.
+			if (shared)
+			{
+				if (!valid_protection(win32_protect))
+					return STATUS_INVALID_PAGE_PROTECTION;
+
+				if (!view_fits_section(win32_protect, host->protection))
+					return STATUS_SECTION_PROTECTION;
+
+				const auto entry = st->sys_proc->handle_table().lookup_handle(section_handle);
+				const auto needed = section_access_needed(win32_protect);
+
+				if (!entry || (entry->access & needed) != needed)
+					return STATUS_ACCESS_DENIED;
+
+				if (rights_of(win32_protect).copy_on_write)
+					THREAD_LOG_WARN("NtMapViewOfSection: copy-on-write is not tracked, so a "
+						"write through this view reaches the section");
+
+				const auto pa = section_backing(cpu, *host);
+
+				// A requested base is rounded down to the allocation granularity.
+				addr_t at = base_address
+					? base_address.read() & ~static_cast<addr_t>(win::alloc_granularity - 1) : 0;
+				auto region = static_cast<std::size_t>(size);
+
+				const auto status = target.mem->map_view(at, region, pa + offset, win32_protect);
+
+				if (status != STATUS_SUCCESS)
+					return status;
+
+				if (base_address)
+					base_address.write(at);
+
+				if (section_offset)
+					section_offset.write(static_cast<std::int64_t>(offset));
+
+				if (view_size)
+					view_size.write(region);
+
+				THREAD_LOG_INFO("NtMapViewOfSection(0x{:X}, '{}', process=0x{:X}, offset={}, "
+					"protect=0x{:X}) -> 0x{:X}, {} bytes shared",
+					section_handle, host->path, process_handle, offset, win32_protect, at, region);
+
+				return STATUS_SUCCESS;
+			}
+
+			auto& space = *target.space;
 
 			std::vector<std::uint8_t> image;
 
@@ -707,7 +1016,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				size = image.size();
 			}
 
-			auto* const mem = user_mem(cpu);
+			auto* const mem = target.mem;
 
 			// STATUS_IMAGE_NOT_AT_BASE is not an error: it tells the loader to relocate.
 			addr_t preferred = 0;
@@ -781,18 +1090,33 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 	state.redirect_ntzw(mod, "UnmapViewOfSection",
 		[st](vcpu& cpu, const std::uint64_t process_handle, const addr_t base_address) -> NTSTATUS
 		{
-			if (!is_current_process(process_handle))
-				return STATUS_INVALID_HANDLE;
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (target.mem)
+			{
+				std::size_t region = 0;
+
+				if (target.mem->unmap_view(base_address, region) == STATUS_SUCCESS)
+				{
+					THREAD_LOG_INFO("NtUnmapViewOfSection(0x{:X}, process=0x{:X}): {} bytes",
+						base_address, process_handle, region);
+
+					return STATUS_SUCCESS;
+				}
+			}
 
 			const auto it = st->views.find(base_address);
 
 			if (it == st->views.end())
 			{
 				THREAD_LOG_WARN("NtUnmapViewOfSection: 0x{:X} is not a mapped view", base_address);
-				return STATUS_INVALID_PARAMETER;
+				return STATUS_NOT_MAPPED_VIEW;
 			}
 
-			auto& space = *cpu.curr_addr_space();
+			auto& space = *target.space;
 			space.mmu_->unmap_virt(space, base_address, it->second);
 
 			THREAD_LOG_INFO("NtUnmapViewOfSection(0x{:X}): {} bytes", base_address, it->second);
@@ -815,10 +1139,6 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const addr_t remote_va, const addr_t local_va, const std::uint64_t size,
 		emu_object<std::uint64_t> bytes, const bool to_remote) -> NTSTATUS
 	{
-		constexpr std::uint32_t process_vm_operation = 0x0008;
-		constexpr std::uint32_t process_vm_read = 0x0010;
-		constexpr std::uint32_t process_vm_write = 0x0020;
-
 		if (bytes)
 			bytes.write(0);
 
