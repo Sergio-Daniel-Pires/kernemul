@@ -811,6 +811,104 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 	state.redirect_ntzw(mod, "OpenSection", open_section);
 	state.redirect_ntzw(mod, "QuerySection", query_section);
 
+	const auto copy_virtual_memory = [st](vcpu& cpu, const std::uint64_t process_handle,
+		const addr_t remote_va, const addr_t local_va, const std::uint64_t size,
+		emu_object<std::uint64_t> bytes, const bool to_remote) -> NTSTATUS
+	{
+		constexpr std::uint32_t process_vm_operation = 0x0008;
+		constexpr std::uint32_t process_vm_read = 0x0010;
+		constexpr std::uint32_t process_vm_write = 0x0020;
+
+		if (bytes)
+			bytes.write(0);
+
+		auto local = cpu.curr_addr_space();
+		auto remote = local;
+
+		if (process_handle && process_handle != current_process_handle)
+		{
+			const auto entry = st->sys_proc->handle_table().lookup_handle(process_handle);
+
+			if (!entry)
+				return STATUS_INVALID_HANDLE;
+
+			const auto process = st->objs.get_object<process_object>(entry->body_addr);
+
+			if (!process)
+				return STATUS_OBJECT_TYPE_MISMATCH;
+
+			const auto required = to_remote ? process_vm_write | process_vm_operation : process_vm_read;
+
+			if ((entry->access & required) != required)
+				return STATUS_ACCESS_DENIED;
+
+			const auto target = st->find_process(static_cast<process::id_type>(process->pid));
+			remote = target ? target->addr_space() : nullptr;
+
+			if (!remote)
+				return STATUS_PROCESS_IS_TERMINATING;
+		}
+
+		auto& from = to_remote ? *local : *remote;
+		auto& to = to_remote ? *remote : *local;
+		const auto from_va = to_remote ? local_va : remote_va;
+		const auto to_va = to_remote ? remote_va : local_va;
+
+		std::vector<std::uint8_t> buffer;
+		std::uint64_t copied = 0;
+		NTSTATUS status = STATUS_SUCCESS;
+
+		while (copied < size && status == STATUS_SUCCESS)
+		{
+			buffer.resize(std::min<std::uint64_t>(0x10000, size - copied));
+
+			try
+			{
+				from.read_mem(from_va + copied, buffer.data(), buffer.size());
+			}
+			catch (const std::exception&)
+			{
+				status = to_remote ? STATUS_ACCESS_VIOLATION : STATUS_PARTIAL_COPY;
+				break;
+			}
+
+			try
+			{
+				to.write_mem(to_va + copied, buffer.data(), buffer.size());
+			}
+			catch (const std::exception&)
+			{
+				status = to_remote ? STATUS_PARTIAL_COPY : STATUS_ACCESS_VIOLATION;
+				break;
+			}
+
+			copied += buffer.size();
+		}
+
+		if (bytes)
+			bytes.write(copied);
+
+		return status;
+	};
+
+	state.redirect_ntzw(mod, "ReadVirtualMemory",
+		[copy_virtual_memory](vcpu& cpu, const std::uint64_t process_handle,
+			const addr_t base_address, const addr_t buffer, const std::uint64_t size,
+			emu_object<std::uint64_t> bytes_read) -> NTSTATUS
+		{
+			return copy_virtual_memory(cpu, process_handle, base_address, buffer, size,
+				std::move(bytes_read), false);
+		});
+
+	state.redirect_ntzw(mod, "WriteVirtualMemory",
+		[copy_virtual_memory](vcpu& cpu, const std::uint64_t process_handle,
+			const addr_t base_address, const addr_t buffer, const std::uint64_t size,
+			emu_object<std::uint64_t> bytes_written) -> NTSTATUS
+		{
+			return copy_virtual_memory(cpu, process_handle, base_address, buffer, size,
+				std::move(bytes_written), true);
+		});
+
 	// Every class is a hint and nothing enforces control flow guard.
 	state.redirect_ntzw(mod, "SetInformationVirtualMemory",
 		[](vcpu&, const std::uint64_t process_handle,
