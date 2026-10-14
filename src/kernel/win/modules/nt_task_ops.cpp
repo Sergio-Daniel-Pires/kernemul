@@ -2,6 +2,7 @@
 #include "../win_kernel.hpp"
 #include "../dispatcher.hpp"
 #include "../objects.hpp"
+#include "../ps_attributes.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../thread.hpp"
@@ -22,6 +23,7 @@ enum thread_information_class : std::uint32_t
 	thread_times                   = 1,
 	thread_am_i_last_thread        = 12,
 	thread_quantum_reset           = 14,
+	thread_impersonation_token     = 5,
 	thread_hide_from_debugger      = 17,
 	thread_is_terminated           = 20,
 };
@@ -128,23 +130,6 @@ std::shared_ptr<win_thread> thread_from_handle(win_kernel_state& state, vcpu& cp
 
 // THREAD_CREATE_FLAGS_CREATE_SUSPENDED: the thread is made but nothing runs it until a resume.
 constexpr std::uint32_t thread_create_suspended = 0x1;
-
-// PS_ATTRIBUTE_LIST as ntdll builds it: a total length in bytes, this header included, followed
-// by that many attributes. Only the two a thread create is told to fill in are handled.
-constexpr std::uint64_t ps_attribute_client_id   = 0x10003;
-constexpr std::uint64_t ps_attribute_teb_address = 0x10004;
-
-#pragma pack(push, 1)
-struct ps_attribute_t
-{
-	std::uint64_t attribute;
-	std::uint64_t size;
-	std::uint64_t value;         // a buffer to write into, for both attributes here
-	std::uint64_t return_length; // where the length written goes, when the caller wants it
-};
-#pragma pack(pop)
-
-static_assert(sizeof(ps_attribute_t) == 0x20);
 
 // An attribute the caller passed but nothing here fills in is left alone rather than refused:
 // the thread is made either way, and the caller reads back whatever it initialised.
@@ -308,6 +293,54 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		thread_handle.write(handle);
 
 		THREAD_LOG_INFO("NtOpenThread(tid={}) -> handle=0x{:X}", tid, handle);
+
+		return STATUS_SUCCESS;
+	};
+
+	auto open_process = [st](vcpu&, emu_object<std::uint64_t> process_handle,
+		const std::uint32_t desired_access, emu_object<_OBJECT_ATTRIBUTES> object_attributes,
+		emu_object<_CLIENT_ID> client_id) -> NTSTATUS
+	{
+		if (!process_handle)
+			return STATUS_INVALID_PARAMETER;
+
+		process_handle.write(0);
+
+		if (!client_id)
+			return STATUS_INVALID_PARAMETER;
+
+		auto pid = guest_va(client_id.field(&_CLIENT_ID::UniqueProcess).read());
+		const auto tid = guest_va(client_id.field(&_CLIENT_ID::UniqueThread).read());
+
+		if (!pid && tid)
+		{
+			if (const auto t = st->find_thread(static_cast<process::thread_id_type>(tid)))
+				pid = t->proc()->id();
+		}
+
+		const auto target = pid ? std::dynamic_pointer_cast<windows_process>(
+			st->find_process(static_cast<process::id_type>(pid))) : nullptr;
+
+		if (!target || !target->eprocess())
+			return STATUS_INVALID_CID;
+
+		auto host = std::make_shared<process_object>();
+		host->pid = pid;
+
+		const std::uint8_t body[sizeof(addr_t)] = {};
+		const auto addr = st->objs.create_object(0, body, sizeof(body), std::move(host),
+			prot_rw | prot_supervisor);
+
+		const auto attributes = object_attributes
+			? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0u;
+
+		const auto handle = addr ? st->sys_proc->handle_table().create_handle(addr, desired_access,
+			(attributes & 0x2) ? win_handle_table::flag_inherit : 0) : 0;
+
+		if (!handle)
+			return STATUS_INSUFFICIENT_RESOURCES;
+
+		process_handle.write(handle);
 
 		return STATUS_SUCCESS;
 	};
@@ -584,6 +617,45 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 				"here acts on it", t->id(), thread_information_class);
 			return STATUS_SUCCESS;
 
+		case thread_impersonation_token:
+		{
+			if (length < sizeof(std::uint64_t))
+				return STATUS_INFO_LENGTH_MISMATCH;
+
+			const auto token_handle = cpu.curr_addr_space()->read_mem<std::uint64_t>(
+				thread_information);
+
+			std::shared_ptr<win::sec::token_host> token;
+
+			if (token_handle)
+			{
+				const auto entry = st->sys_proc->handle_table().lookup_handle(token_handle);
+
+				if (!entry)
+					return STATUS_INVALID_HANDLE;
+
+				token = st->objs.get_object<win::sec::token_host>(entry->body_addr);
+
+				if (!token)
+					return STATUS_OBJECT_TYPE_MISMATCH;
+
+				if (!(entry->access & win::sec::token_impersonate))
+					return STATUS_ACCESS_DENIED;
+
+				std::scoped_lock lock(token->mtx);
+
+				if (token->data.type != win::sec::token_impersonation)
+					return STATUS_BAD_TOKEN_TYPE;
+			}
+
+			t->set_impersonation_token(token);
+
+			if (t->teb())
+				t->teb().field(&_TEB64::IsImpersonating).write(token ? 1u : 0u);
+
+			return STATUS_SUCCESS;
+		}
+
 		default:
 			THREAD_LOG_WARN("NtSetInformationThread(tid={}, class={}, buffer=0x{:X}/{}): "
 				"unhandled class", t->id(), thread_information_class, thread_information, length);
@@ -818,28 +890,6 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		return STATUS_SUCCESS;
 	};
 
-	auto open_thread_token = [](vcpu&, const std::uint64_t thread_handle,
-		const std::uint32_t desired_access, const bool open_as_self,
-		emu_object<std::uint64_t> token_handle) -> NTSTATUS
-	{
-		if (token_handle)
-			token_handle.write(0);
-
-		THREAD_LOG_WARN("NtOpenThreadToken(handle=0x{:X}, access=0x{:X}, as_self={}): nothing "
-			"here carries a token", thread_handle, desired_access, open_as_self);
-
-		return STATUS_NO_TOKEN;
-	};
-
-	auto open_thread_token_ex = [open_thread_token](vcpu& cpu, const std::uint64_t thread_handle,
-		const std::uint32_t desired_access, const bool open_as_self,
-		[[maybe_unused]] const std::uint32_t handle_attributes,
-		emu_object<std::uint64_t> token_handle) -> NTSTATUS
-	{
-		return open_thread_token(cpu, thread_handle, desired_access, open_as_self,
-			std::move(token_handle));
-	};
-
 	auto terminate_process = [st](vcpu& cpu, const std::uint64_t process_handle,
 		const NTSTATUS exit_status) -> NTSTATUS
 	{
@@ -919,6 +969,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 	state.redirect_ntzw(mod, "CreateThreadEx", create_thread);
 	state.redirect_ntzw(mod, "OpenThread", open_thread);
+	state.redirect_ntzw(mod, "OpenProcess", open_process);
 	state.redirect_ntzw(mod, "TerminateThread", terminate_thread);
 	state.redirect_ntzw(mod, "DelayExecution", delay_execution);
 	state.redirect_ntzw(mod, "QueryInformationThread", query_thread);
@@ -936,7 +987,5 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 	state.redirect_ntzw(mod, "AlertThreadByThreadId", alert_thread);
 	state.redirect_ntzw(mod, "WaitForAlertByThreadId", wait_for_alert);
-	state.redirect_ntzw(mod, "OpenThreadToken", open_thread_token);
-	state.redirect_ntzw(mod, "OpenThreadTokenEx", open_thread_token_ex);
 	state.redirect_ntzw(mod, "TerminateProcess", terminate_process);
 }

@@ -48,6 +48,8 @@ struct win_kernel_state : kernel_state
 
 	std::unique_ptr<win_syscall> syscalls = make_win_syscall();
 
+	std::shared_ptr<class pipe_manager> pipes;
+
 	// One per machine: the trampoline it returns through is a single address.
 	guest_caller calls;
 
@@ -300,8 +302,10 @@ struct win_kernel_state : kernel_state
 
 		if (!fn)
 		{
-			// Unlike an unimplemented export this does not end the thread.
-			THREAD_LOG_WARN("unimplemented syscall 0x{:X}", id);
+			const auto name = syscalls ? syscalls->name(id) : std::string_view();
+
+			THREAD_LOG_WARN("unimplemented syscall 0x{:X} ({})", id,
+				name.empty() ? std::string_view("unknown") : name);
 			emu_->call_conv()->ret(cpu, static_cast<NTSTATUS>(STATUS_NOT_IMPLEMENTED));
 			return false;
 		}
@@ -866,10 +870,11 @@ public:
 	};
 
 	// The thread starts at ntdll's LdrInitializeThunk, not at the image's entry point.
-	user_process_args create_user_process(vcpu& cpu, const std::string_view exe_name)
+	user_process_args create_user_process(vcpu& cpu, const std::string_view exe_name,
+		const bool suspended = false, const std::string_view image_path = {})
 	{
 		auto proc = std::dynamic_pointer_cast<win_user_proc>(
-			kernel_.create_process(exe_name));
+			kernel_.create_process(image_path.empty() ? exe_name : image_path));
 
 		if (!proc)
 		{
@@ -912,10 +917,15 @@ public:
 			return {};
 
 		setup_loader_frame(*t, cpu, image->entry_point, ntdll->addr, 0);
+
+		if (suspended)
+			std::static_pointer_cast<win_thread>(t)->suspend();
+
 		t->start();
 
-		LOG_INFO("user process {} (pid={}): image at 0x{:X}, entry 0x{:X}, loader at 0x{:X}",
-			exe_name, proc->id(), image->addr, image->entry_point, *ldr_init);
+		LOG_INFO("user process {} (pid={}): image at 0x{:X}, entry 0x{:X}, loader at 0x{:X}{}",
+			exe_name, proc->id(), image->addr, image->entry_point, *ldr_init,
+			suspended ? ", suspended" : "");
 
 		return { std::move(proc), image, std::move(t) };
 	}
