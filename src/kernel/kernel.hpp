@@ -134,6 +134,19 @@ struct kernel_state
 		return it != processes.end() ? it->second : nullptr;
 	}
 
+	[[nodiscard]] std::vector<std::shared_ptr<process>> all_processes()
+	{
+		std::shared_lock lock(proc_mtx_);
+
+		std::vector<std::shared_ptr<process>> out;
+		out.reserve(processes.size());
+
+		for (const auto& [_, proc] : processes)
+			out.push_back(proc);
+
+		return out;
+	}
+
 	// Thread ids are handed out machine wide rather than per process, so this searches all of them.
 	std::shared_ptr<thread> find_thread(const process::thread_id_type id)
 	{
