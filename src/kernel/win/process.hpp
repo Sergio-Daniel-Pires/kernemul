@@ -148,6 +148,26 @@ public:
 		params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardError).write(handle(err));
 	}
 
+	[[nodiscard]] addr_t process_parameters_address() const { return params_.address(); }
+
+	void set_process_parameters(const std::u16string_view image_path,
+		const std::u16string_view command_line)
+	{
+		const auto in = params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardInput).read();
+		const auto out = params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardOutput).read();
+		const auto err = params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardError).read();
+
+		params_ = win::init_process_parameters(mem_, image_path, command_line);
+
+		params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardInput).write(in);
+		params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardOutput).write(out);
+		params_.field(&_RTL_USER_PROCESS_PARAMETERS::StandardError).write(err);
+
+		auto peb = peb_.read();
+		peb.ProcessParameters = params_.address();
+		peb_.write(peb);
+	}
+
 	addr_t thread_exit_addr() const override
 	{
 		return find_symbol(ntdll_name, user_thread_startup);

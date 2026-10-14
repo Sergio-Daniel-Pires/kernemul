@@ -220,7 +220,7 @@ void win_kernel_proc::module_add_cb(proc_module& mod)
 
 	entry.BaseDllName = win::init_unicode_string(space, wide_name, prot_rw | prot_supervisor);
 
-	// What the kernel reports, which is never a drive letter: a driver goes under drivers\,
+	// What the kernel reports, which is never a drive letter: a driver goes under drivers\, 
 	// everything else sits in system32 itself.
 	const std::u16string dir = mod.lookup_name.ends_with(".sys")
 		? u"\\SystemRoot\\System32\\drivers\\"
@@ -265,14 +265,30 @@ void windows_process::wake_waiters(struct addr_space& space, const addr_t object
 {
 	bool released = false;
 
-	for_each_thread([&](win_thread& t)
+	const auto wake = [&](const windows_process& proc)
 	{
-		if (t.waiting_on(object) && t.try_satisfy(space))
+		proc.for_each_thread([&](win_thread& t)
 		{
-			THREAD_LOG_INFO("wait on 0x{:X} satisfied for tid={}", object, t.id());
-			released = true;
+			if (t.waiting_on(object) && t.try_satisfy(space))
+			{
+				THREAD_LOG_INFO("wait on 0x{:X} satisfied for tid={}", object, t.id());
+				released = true;
+			}
+		});
+	};
+
+	if (emulator_)
+	{
+		for (const auto& proc : emulator_->kernel().all_processes())
+		{
+			if (const auto win_proc = std::dynamic_pointer_cast<windows_process>(proc))
+				wake(*win_proc);
 		}
-	});
+	}
+	else
+	{
+		wake(*this);
+	}
 
 	// Satisfying the wait is only half of releasing the thread: it is runnable again without
 	// having been queued, and a cpu parked on an empty answer does not look a second time on
