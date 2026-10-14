@@ -220,7 +220,7 @@ void win_kernel_proc::module_add_cb(proc_module& mod)
 
 	entry.BaseDllName = win::init_unicode_string(space, wide_name, prot_rw | prot_supervisor);
 
-	// What the kernel reports, which is never a drive letter: a driver goes under drivers\, 
+	// What the kernel reports, which is never a drive letter: a driver goes under drivers\,
 	// everything else sits in system32 itself.
 	const std::u16string dir = mod.lookup_name.ends_with(".sys")
 		? u"\\SystemRoot\\System32\\drivers\\"
