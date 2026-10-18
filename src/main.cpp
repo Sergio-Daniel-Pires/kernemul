@@ -60,6 +60,13 @@ static std::uint64_t g_mod_size = 0;
 // single-step stream: driver RVAs in execution order, capped
 static std::vector<std::uint32_t> g_rip_seq;
 static std::size_t g_rip_seq_cap = 0;
+// first-entry milestones: watched RVAs and the first index inside a range
+static std::vector<std::uint64_t> g_watch_rva;
+static std::vector<std::uint64_t> g_watch_first;   // index+1, 0 = not yet hit
+static std::uint64_t g_in_lo = 0, g_in_hi = 0;
+static std::uint64_t g_in_idx = 0, g_in_rva = 0;
+static int g_in_done = 0;
+static std::uint64_t g_step_idx = 0;
 
 void print_usage()
 {
@@ -97,17 +104,57 @@ std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
 			g_rip_seq.reserve(g_rip_seq_cap);
 		const addr_t b = driver->addr;
 		const addr_t s = driver->size;
-		LOG_INFO("[RIP_TRACE] tracing module {} at 0x{:X} size 0x{:X} steps_cap={}", name, b, s, g_rip_seq_cap);
+		if (const char* w = std::getenv("KERNEMUL_WATCH"))
+		{
+			std::string spec(w);
+			std::size_t pos = 0;
+			while (pos <= spec.size())
+			{
+				const auto comma = spec.find(',', pos);
+				const auto tok = spec.substr(pos, comma == std::string::npos
+					? std::string::npos : comma - pos);
+				if (!tok.empty())
+				{
+					g_watch_rva.push_back(strtoull(tok.c_str(), nullptr, 0));
+					g_watch_first.push_back(0);
+				}
+				if (comma == std::string::npos) break;
+				pos = comma + 1;
+			}
+		}
+		if (const char* r = std::getenv("KERNEMUL_FIRST_IN"))
+		{
+			const std::string spec(r);
+			const auto dash = spec.find('-');
+			if (dash != std::string::npos)
+			{
+				g_in_lo = strtoull(spec.substr(0, dash).c_str(), nullptr, 0);
+				g_in_hi = strtoull(spec.substr(dash + 1).c_str(), nullptr, 0);
+			}
+		}
+		LOG_INFO("[RIP_TRACE] tracing module {} at 0x{:X} size 0x{:X} steps_cap={} watch={} first_in=0x{:X}-0x{:X}",
+			name, b, s, g_rip_seq_cap, g_watch_rva.size(), g_in_lo, g_in_hi);
 		e.hook_code(b, b + s - 1, [b, s](vcpu&, addr_t addr, std::size_t)
 		{
 			if (addr >= b && addr < b + s)
 			{
-				g_rip_pages[(addr - b) >> 12] = 1;
+				const std::uint64_t rva = addr - b;
+				const std::uint64_t idx = g_step_idx++;
+				g_rip_pages[rva >> 12] = 1;
 				++g_rip_total;
 				if (addr < g_rip_min) g_rip_min = addr;
 				if (addr > g_rip_max) g_rip_max = addr;
 				if (g_rip_seq.size() < g_rip_seq_cap)
-					g_rip_seq.push_back(static_cast<std::uint32_t>(addr - b));
+					g_rip_seq.push_back(static_cast<std::uint32_t>(rva));
+				if (!g_in_done && g_in_hi > g_in_lo && rva >= g_in_lo && rva < g_in_hi)
+				{
+					g_in_idx = idx;
+					g_in_rva = rva;
+					g_in_done = 1;
+				}
+				for (std::size_t i = 0; i < g_watch_rva.size(); ++i)
+					if (!g_watch_first[i] && rva == g_watch_rva[i])
+						g_watch_first[i] = idx + 1;
 			}
 		});
 	}
@@ -231,6 +278,17 @@ int main(const int argc, const char* const* const argv)
 		LOG_INFO("[RIP_TRACE] module base=0x{:X} size=0x{:X} instrs={} pages={}/{} min=0x{:X} max=0x{:X}",
 			g_mod_base, g_mod_size, g_rip_total, pages, g_rip_pages.size(),
 			g_rip_total ? g_rip_min : 0, g_rip_max);
+		if (g_in_hi > g_in_lo)
+		{
+			if (g_in_done)
+				LOG_INFO("[RIP_TRACE] first_in 0x{:X}-0x{:X}: idx={} rva=0x{:X}",
+					g_in_lo, g_in_hi, g_in_idx, g_in_rva);
+			else
+				LOG_INFO("[RIP_TRACE] first_in 0x{:X}-0x{:X}: NOT REACHED", g_in_lo, g_in_hi);
+		}
+		for (std::size_t i = 0; i < g_watch_rva.size(); ++i)
+			LOG_INFO("[RIP_TRACE] watch 0x{:X}: first_idx={}",
+				g_watch_rva[i], g_watch_first[i] ? static_cast<long long>(g_watch_first[i] - 1) : -1LL);
 		if (std::FILE* f = std::fopen("/tmp/opencode/kernemul-rip-pages.txt", "w"))
 		{
 			for (std::size_t i = 0; i < g_rip_pages.size(); ++i)
