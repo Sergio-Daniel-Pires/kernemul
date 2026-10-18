@@ -50,6 +50,17 @@ struct guest_image
 	std::shared_ptr<thread> entry;
 };
 
+// ---- LOCAL MEASUREMENT PATCH (not upstream): guest RIP page tracer ----
+static std::vector<std::uint64_t> g_rip_pages;
+static std::uint64_t g_rip_total = 0;
+static addr_t g_rip_min = ~static_cast<addr_t>(0);
+static addr_t g_rip_max = 0;
+static addr_t g_mod_base = 0;
+static std::uint64_t g_mod_size = 0;
+// single-step stream: driver RVAs in execution order, capped
+static std::vector<std::uint32_t> g_rip_seq;
+static std::size_t g_rip_seq_cap = 0;
+
 void print_usage()
 {
 	LOG_INFO("usage: kernemul [image...]");
@@ -60,7 +71,8 @@ void print_usage()
 }
 
 std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
-	const std::shared_ptr<guest::calling_conv>& conv, vcpu& cpu, const std::string& name)
+	const std::shared_ptr<guest::calling_conv>& conv, vcpu& cpu, const std::string& name,
+	emu& e)
 {
 	auto& kernel = win.kernel();
 	auto& proc = *kernel.sys_proc;
@@ -71,6 +83,33 @@ std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
 	{
 		LOG_ERR("failed to map {}", name);
 		return {};
+	}
+
+	// ---- LOCAL MEASUREMENT PATCH (not upstream) ----
+	if (const char* t = std::getenv("KERNEMUL_RIP_TRACE"); t && *t == '1')
+	{
+		g_mod_base = driver->addr;
+		g_mod_size = driver->size;
+		g_rip_pages.assign((driver->size + 0xFFF) / 0x1000, 0);
+		if (const char* n = std::getenv("KERNEMUL_RIP_STEPS"))
+			g_rip_seq_cap = static_cast<std::size_t>(strtoull(n, nullptr, 0));
+		if (g_rip_seq_cap)
+			g_rip_seq.reserve(g_rip_seq_cap);
+		const addr_t b = driver->addr;
+		const addr_t s = driver->size;
+		LOG_INFO("[RIP_TRACE] tracing module {} at 0x{:X} size 0x{:X} steps_cap={}", name, b, s, g_rip_seq_cap);
+		e.hook_code(b, b + s - 1, [b, s](vcpu&, addr_t addr, std::size_t)
+		{
+			if (addr >= b && addr < b + s)
+			{
+				g_rip_pages[(addr - b) >> 12] = 1;
+				++g_rip_total;
+				if (addr < g_rip_min) g_rip_min = addr;
+				if (addr > g_rip_max) g_rip_max = addr;
+				if (g_rip_seq.size() < g_rip_seq_cap)
+					g_rip_seq.push_back(static_cast<std::uint32_t>(addr - b));
+			}
+		});
 	}
 
 	// Up to the first dot, not the last: a variant build is named <service>.<variant>.sys, and
@@ -153,7 +192,7 @@ int main(const int argc, const char* const* const argv)
 	{
 		if (image.driver)
 		{
-			image.entry = setup_driver(win, conv, *cpu, image.name);
+			image.entry = setup_driver(win, conv, *cpu, image.name, *e);
 
 			if (!image.entry)
 				return 1;
@@ -172,6 +211,58 @@ int main(const int argc, const char* const* const argv)
 			LOG_INFO("{} returned, status=0x{:X}", image.name, conv->read_ret(*cpu, *image.entry));
 		else
 			LOG_INFO("{} finished", image.name);
+	}
+
+	// ---- LOCAL MEASUREMENT PATCH (not upstream) ----
+	if (!g_rip_pages.empty())
+	{
+		std::uint64_t pages = 0;
+		for (auto v : g_rip_pages) pages += v ? 1 : 0;
+		LOG_INFO("[RIP_TRACE] module base=0x{:X} size=0x{:X} instrs={} pages={}/{} min=0x{:X} max=0x{:X}",
+			g_mod_base, g_mod_size, g_rip_total, pages, g_rip_pages.size(),
+			g_rip_total ? g_rip_min : 0, g_rip_max);
+		if (std::FILE* f = std::fopen("/tmp/opencode/kernemul-rip-pages.txt", "w"))
+		{
+			for (std::size_t i = 0; i < g_rip_pages.size(); ++i)
+				if (g_rip_pages[i])
+					std::fprintf(f, "0x%llX\n", static_cast<unsigned long long>(g_mod_base + i * 0x1000));
+			std::fclose(f);
+			LOG_INFO("[RIP_TRACE] wrote /tmp/opencode/kernemul-rip-pages.txt");
+		}
+		if (!g_rip_seq.empty())
+		{
+			if (std::FILE* f = std::fopen("/tmp/opencode/kernemul-rip-seq.bin", "wb"))
+			{
+				std::fwrite("KSEQ1\0", 1, 6, f);
+				std::uint32_t prev = 0;
+				std::vector<std::uint8_t> buf;
+				buf.reserve(1 << 20);
+				for (std::uint32_t rva : g_rip_seq)
+				{
+					const std::int64_t d = static_cast<std::int64_t>(rva)
+						- static_cast<std::int64_t>(prev);
+					prev = rva;
+					std::uint64_t z = (static_cast<std::uint64_t>(d) << 1)
+						^ static_cast<std::uint64_t>(d >> 63);
+					while (z >= 0x80)
+					{
+						buf.push_back(static_cast<std::uint8_t>(z | 0x80));
+						z >>= 7;
+					}
+					buf.push_back(static_cast<std::uint8_t>(z));
+					if (buf.size() >= (1u << 20))
+					{
+						std::fwrite(buf.data(), 1, buf.size(), f);
+						buf.clear();
+					}
+				}
+				if (!buf.empty())
+					std::fwrite(buf.data(), 1, buf.size(), f);
+				std::fclose(f);
+				LOG_INFO("[RIP_TRACE] wrote /tmp/opencode/kernemul-rip-seq.bin steps={}",
+					g_rip_seq.size());
+			}
+		}
 	}
 
 	return 0;
