@@ -67,6 +67,14 @@ static std::uint64_t g_in_lo = 0, g_in_hi = 0;
 static std::uint64_t g_in_idx = 0, g_in_rva = 0;
 static int g_in_done = 0;
 static std::uint64_t g_step_idx = 0;
+// record the stream only from the first hit of this RVA (allow-pair analogue)
+static std::uint64_t g_seq_from_rva = 0;
+static int g_seq_started = 0;
+// one-shot guest register dump at given RVAs (pre-state of that instruction)
+static std::uint64_t g_regs_rva[8];
+static std::uint64_t g_regs_vals[8][18];
+static int g_regs_hit[8];
+static int g_regs_count = 0;
 
 void print_usage()
 {
@@ -100,6 +108,23 @@ std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
 		g_rip_pages.assign((driver->size + 0xFFF) / 0x1000, 0);
 		if (const char* n = std::getenv("KERNEMUL_RIP_STEPS"))
 			g_rip_seq_cap = static_cast<std::size_t>(strtoull(n, nullptr, 0));
+		if (const char* f = std::getenv("KERNEMUL_SEQ_FROM_RVA"))
+			g_seq_from_rva = strtoull(f, nullptr, 0);
+		if (const char* g = std::getenv("KERNEMUL_REGS_AT"))
+		{
+			const std::string spec(g);
+			std::size_t pos = 0;
+			while (pos <= spec.size() && g_regs_count < 8)
+			{
+				const auto comma = spec.find(',', pos);
+				const auto tok = spec.substr(pos, comma == std::string::npos
+					? std::string::npos : comma - pos);
+				if (!tok.empty())
+					g_regs_rva[g_regs_count++] = strtoull(tok.c_str(), nullptr, 0);
+				if (comma == std::string::npos) break;
+				pos = comma + 1;
+			}
+		}
 		if (g_rip_seq_cap)
 			g_rip_seq.reserve(g_rip_seq_cap);
 		const addr_t b = driver->addr;
@@ -134,19 +159,30 @@ std::shared_ptr<thread> setup_driver(guest::win_emulator& win,
 		}
 		LOG_INFO("[RIP_TRACE] tracing module {} at 0x{:X} size 0x{:X} steps_cap={} watch={} first_in=0x{:X}-0x{:X}",
 			name, b, s, g_rip_seq_cap, g_watch_rva.size(), g_in_lo, g_in_hi);
-		e.hook_code(b, b + s - 1, [b, s](vcpu&, addr_t addr, std::size_t)
+		e.hook_code(b, b + s - 1, [b, s](vcpu& cpu, addr_t addr, std::size_t)
 		{
 			if (addr >= b && addr < b + s)
 			{
 				const std::uint64_t rva = addr - b;
 				const std::uint64_t idx = g_step_idx++;
+				if (g_regs_count)
+				{
+					for (int t = 0; t < g_regs_count; ++t)
+						if (!g_regs_hit[t] && rva == g_regs_rva[t])
+						{
+							for (int r = 0; r < 18; ++r)
+								g_regs_vals[t][r] = cpu.reg<std::uint64_t>(static_cast<reg_t>(r));
+							g_regs_hit[t] = 1;
+						}
+				}
 				g_rip_pages[rva >> 12] = 1;
 				++g_rip_total;
 				if (addr < g_rip_min) g_rip_min = addr;
 				if (addr > g_rip_max) g_rip_max = addr;
-				if (g_rip_seq.size() < g_rip_seq_cap)
-					g_rip_seq.push_back(static_cast<std::uint32_t>(rva));
-				if (!g_in_done && g_in_hi > g_in_lo && rva >= g_in_lo && rva < g_in_hi)
+				if (g_seq_from_rva && !g_seq_started && rva == g_seq_from_rva)
+					g_seq_started = 1;
+				if ((!g_seq_from_rva || g_seq_started) && g_rip_seq.size() < g_rip_seq_cap)
+					g_rip_seq.push_back(static_cast<std::uint32_t>(rva));				if (!g_in_done && g_in_hi > g_in_lo && rva >= g_in_lo && rva < g_in_hi)
 				{
 					g_in_idx = idx;
 					g_in_rva = rva;
@@ -289,6 +325,19 @@ int main(const int argc, const char* const* const argv)
 		for (std::size_t i = 0; i < g_watch_rva.size(); ++i)
 			LOG_INFO("[RIP_TRACE] watch 0x{:X}: first_idx={}",
 				g_watch_rva[i], g_watch_first[i] ? static_cast<long long>(g_watch_first[i] - 1) : -1LL);
+		static const char* rnames[18] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+			"r8","r9","r10","r11","r12","r13","r14","r15","rip","rflags"};
+		for (int t = 0; t < g_regs_count; ++t)
+		{
+			if (!g_regs_hit[t])
+			{
+				LOG_INFO("[RIP_TRACE] regs_at 0x{:X}: NOT REACHED", g_regs_rva[t]);
+				continue;
+			}
+			LOG_INFO("[RIP_TRACE] regs_at 0x{:X}:", g_regs_rva[t]);
+			for (int r = 0; r < 18; ++r)
+				LOG_INFO("[RIP_TRACE]   {:>6}={:016X}", rnames[r], g_regs_vals[t][r]);
+		}
 		if (std::FILE* f = std::fopen("/tmp/opencode/kernemul-rip-pages.txt", "w"))
 		{
 			for (std::size_t i = 0; i < g_rip_pages.size(); ++i)
