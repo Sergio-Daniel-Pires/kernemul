@@ -182,7 +182,17 @@ int main(const int argc, const char* const* const argv)
 
 	guest::win_emulator win(e);
 
-	win.create_vcpus(vcpu_count);
+	// ---- LOCAL MEASUREMENT PATCH (not upstream): deterministic trace support ----
+	// Multi-vCPU scheduling makes the executed-instruction count vary run to run,
+	// which defeats cross-runtime trace alignment. KERNEMUL_VCPUS pins it.
+	std::size_t vcpus = vcpu_count;
+	if (const char* v = std::getenv("KERNEMUL_VCPUS"))
+	{
+		const auto n = std::strtoull(v, nullptr, 0);
+		if (n >= 1 && n <= 64)
+			vcpus = static_cast<std::size_t>(n);
+	}
+	win.create_vcpus(vcpus);
 
 	const auto cpu = win.cpus().front();
 
