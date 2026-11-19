@@ -331,6 +331,13 @@ private:
 		cpu_enabled_ = parse_u64(std::getenv("KERNEMUL_CHUNK_NO_CPU"), 0) == 0;
 		parse_range_list(std::getenv("KERNEMUL_CHUNK_STACK"), cpu_stack_);
 		parse_range_list(std::getenv("KERNEMUL_CHUNK_POOL"), cpu_pool_);
+		// Ordered classification rules; see load_cpu_rules().
+		parse_cpu_rules(std::getenv("KERNEMUL_CHUNK_REGION_RULES"));
+		for (const auto& range : cpu_stack_)
+			cpu_rule_add(kCpuStack, 1, range.base, range.size);
+		for (const auto& range : cpu_pool_)
+			cpu_rule_add(kCpuPool, 1, range.base, range.size);
+		run_cpu_probe(std::getenv("KERNEMUL_CHUNK_REGION_PROBE"));
 		if (const char* watch = std::getenv("KERNEMUL_CHUNK_WATCH"))
 			parse_watch(watch);
 
@@ -879,28 +886,98 @@ private:
 	// -- per-step CPU digests (CPU_RAW / CPU_SYMBOLIC) ----------------------
 	// Mirror of src/trace/lwk_chunk.c: both emitters must hash the same bytes
 	// for equivalent state, so the two sides are directly comparable.
-	static void cpu_classify(std::uint64_t value, std::uint64_t base,
-		std::uint64_t image_size, const std::vector<ctrl_range>& stack,
-		const std::vector<ctrl_range>& pool, std::uint8_t& cls,
-		std::uint64_t& payload)
+	//
+	// One ordered rule per classified region: the first match wins and values
+	// that match nothing are SCALAR.  Rules are data (KERNEMUL_CHUNK_REGION_RULES
+	// "kind:base:size:mode;..."), so a new edge case is one more rule rather
+	// than a change to the classifier.
+	struct cpu_rule
 	{
-		if (base && image_size && value - base < image_size)
+		std::uint8_t kind = 0;
+		std::uint8_t payload_mode = 1;
+		std::uint64_t base = 0;
+		std::uint64_t size = 0;
+	};
+
+	void cpu_rule_add(std::uint8_t kind, std::uint8_t payload_mode,
+		std::uint64_t base, std::uint64_t size)
+	{
+		if (!size || cpu_rules_.size() >= kMaxCpuRules)
+			return;
+		cpu_rules_.push_back(cpu_rule{ kind, payload_mode, base, size });
+	}
+
+	void parse_cpu_rules(const char* text)
+	{
+		if (!text || !*text)
+			return;
+		std::string list(text);
+		std::size_t start = 0;
+		while (start <= list.size())
+		{
+			const auto end = list.find(';', start);
+			const std::string item = list.substr(start,
+				end == std::string::npos ? std::string::npos : end - start);
+			start = end == std::string::npos ? list.size() + 1 : end + 1;
+			if (item.empty())
+				continue;
+			unsigned kind = 0, mode = 1;
+			unsigned long long base = 0, size = 0;
+			if (std::sscanf(item.c_str(), "%u:%llx:%llx:%u", &kind, &base,
+					&size, &mode) < 3)
+				continue;
+			cpu_rule_add(static_cast<std::uint8_t>(kind),
+				static_cast<std::uint8_t>(mode ? 1 : 0),
+				static_cast<std::uint64_t>(base),
+				static_cast<std::uint64_t>(size));
+		}
+	}
+
+	void run_cpu_probe(const char* text) const
+	{
+		if (!text || !*text)
+			return;
+		const std::string list(text);
+		std::size_t start = 0;
+		while (start <= list.size())
+		{
+			const auto end = list.find(',', start);
+			const std::string item = list.substr(start,
+				end == std::string::npos ? std::string::npos : end - start);
+			start = end == std::string::npos ? list.size() + 1 : end + 1;
+			if (item.empty())
+				continue;
+			char* stop = nullptr;
+			const auto value = std::strtoull(item.c_str(), &stop, 0);
+			if (stop == item.c_str())
+				continue;
+			std::uint8_t cls = kCpuScalar;
+			std::uint64_t payload = 0;
+			cpu_classify(value, cls, payload);
+			std::fprintf(stderr,
+				"[CPU_CLASS] value=0x%016llX kind=%u payload=0x%016llX\n",
+				static_cast<unsigned long long>(value), static_cast<unsigned>(cls),
+				static_cast<unsigned long long>(payload));
+		}
+	}
+
+	void cpu_classify(std::uint64_t value, std::uint8_t& cls,
+		std::uint64_t& payload) const
+	{
+		if (base_ && image_size_ && value - base_ < image_size_)
 		{
 			cls = kCpuModule;
-			payload = value - base;
+			payload = value - base_;
 			return;
 		}
-		if (range_list_contains(stack, value))
+		for (const auto& rule : cpu_rules_)
 		{
-			cls = kCpuStack;
-			payload = 0;
-			return;
-		}
-		if (range_list_contains(pool, value))
-		{
-			cls = kCpuPool;
-			payload = 0;
-			return;
+			if (value - rule.base < rule.size)
+			{
+				cls = rule.kind;
+				payload = rule.payload_mode ? 0 : value - rule.base;
+				return;
+			}
 		}
 		cls = kCpuScalar;
 		payload = value;
@@ -921,8 +998,7 @@ private:
 		{
 			std::uint8_t cls = kCpuScalar;
 			std::uint64_t payload = 0;
-			cpu_classify(gprs[index], base_, image_size_, cpu_stack_,
-				cpu_pool_, cls, payload);
+			cpu_classify(gprs[index], cls, payload);
 			hash = fnv_u8(hash, cls);
 			hash = fnv_u64(hash, payload);
 		}
@@ -1459,4 +1535,6 @@ private:
 	std::uint64_t cpu_sym_ = kFnvOffset;
 	std::vector<ctrl_range> cpu_stack_;
 	std::vector<ctrl_range> cpu_pool_;
+	std::vector<cpu_rule> cpu_rules_;
+	static constexpr std::size_t kMaxCpuRules = 16;
 };
