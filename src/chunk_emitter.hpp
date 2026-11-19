@@ -188,8 +188,11 @@ public:
 			else
 			{
 				std::uint64_t ea = 0, bytes = 0;
+				store other{};
 				if (decode_block_copy(opcode, length, gprs, ea, bytes))
 					record_block_write(seq, ea, bytes);
+				else if (decode_other_store(opcode, length, gprs, rip, other) > 0)
+					record_write(seq, other);
 			}
 		}
 		if (ctrl_enabled_ && opcode && gprs)
@@ -682,6 +685,108 @@ private:
 		ea = gprs[7];
 		bytes = count * size;
 		return true;
+	}
+
+	// Stores that decode_store does not model: SSE register->memory moves,
+	// push [mem] and pop [mem].  The value being written lives in an XMM register
+	// or in memory, so it is recorded as opaque (real EA and width, value 0).
+	// The LWK emitter does exactly the same, so the digest still compares where,
+	// how wide and in what order each unmodelled store went.
+	static int decode_other_store(const std::uint8_t* opcode,
+		std::size_t length, const std::uint64_t* gprs, std::uint64_t rip,
+		store& out)
+	{
+		if (!opcode || !gprs || !length)
+			return 0;
+		std::size_t index = 0;
+		unsigned rex = 0;
+		bool addr32 = false, prefix_f2 = false, prefix_f3 = false;
+		while (index < length)
+		{
+			const auto byte = opcode[index];
+			if (byte == 0x2E || byte == 0x36 || byte == 0x3E || byte == 0x26 ||
+				byte == 0x64 || byte == 0x65 || byte == 0x66 || byte == 0x67 ||
+				byte == 0xF0 || byte == 0xF2 || byte == 0xF3)
+			{
+				if (byte == 0x67)
+					addr32 = true;
+				if (byte == 0xF2)
+					prefix_f2 = true;
+				if (byte == 0xF3)
+					prefix_f3 = true;
+				++index;
+				continue;
+			}
+			if (byte >= 0x40 && byte <= 0x4F)
+			{
+				rex = byte;
+				++index;
+				continue;
+			}
+			break;
+		}
+		if (index >= length)
+			return 0;
+		const auto op = opcode[index++];
+		const int rex_b = (rex & 0x01) ? 8 : 0;
+		const int rex_x = (rex & 0x02) ? 8 : 0;
+
+		if (op == 0x0F)
+		{
+			if (index >= length)
+				return 0;
+			const auto op2 = opcode[index++];
+			std::uint8_t width = 0;
+			switch (op2)
+			{
+			case 0x11: width = prefix_f3 ? 4 : (prefix_f2 ? 8 : 16); break;
+			case 0x13: case 0x17: case 0xD6: width = 8; break;
+			case 0x29: case 0x7F: width = 16; break;
+			default: return 0;
+			}
+			std::uint64_t ea = 0;
+			const int decoded = read_modrm_ea(opcode, length, index, gprs,
+				rex_b, rex_x, addr32, rip, 0, ea);
+			if (decoded <= 0)
+				return decoded;
+			out.ea = ea;
+			out.width = width;
+			out.value = 0;
+			return 1;
+		}
+
+		if (op == 0xFF || op == 0x8F)
+		{
+			if (index >= length)
+				return 0;
+			const auto modrm = opcode[index];
+			const unsigned group = (modrm >> 3) & 7;
+			const unsigned mod = modrm >> 6;
+			if (op == 0xFF && group != 6)
+				return 0;
+			if (op == 0x8F && group != 0)
+				return 0;
+			if (mod == 3)
+			{
+				if (op != 0xFF)
+					return 0;
+				const unsigned reg = (modrm & 7) + static_cast<unsigned>(rex_b);
+				out.ea = gprs[4] - 8;
+				out.width = 8;
+				out.value = gprs[reg & 15];
+				return 1;
+			}
+			std::uint64_t ea = 0;
+			const int decoded = read_modrm_ea(opcode, length, index, gprs,
+				rex_b, rex_x, addr32, rip, 0, ea);
+			if (decoded <= 0)
+				return decoded;
+			out.ea = (op == 0x8F) ? ea : gprs[4] - 8;
+			out.width = 8;
+			out.value = 0;
+			return 1;
+		}
+		return 0;
 	}
 
 	void record_block_write(std::uint64_t insn_seq, std::uint64_t ea,
