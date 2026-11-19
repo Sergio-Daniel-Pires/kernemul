@@ -185,6 +185,12 @@ public:
 				record_write(seq, decoded);
 			else if (status < 0)
 				++writes_skipped_;
+			else
+			{
+				std::uint64_t ea = 0, bytes = 0;
+				if (decode_block_copy(opcode, length, gprs, ea, bytes))
+					record_block_write(seq, ea, bytes);
+			}
 		}
 		if (ctrl_enabled_ && opcode && gprs)
 		{
@@ -627,6 +633,74 @@ private:
 				return rva;
 		}
 		return ea;
+	}
+
+	// rep movs/stos write memory without a ModRM store, so decode_store cannot
+	// see them and the write log would silently miss them.
+	static bool decode_block_copy(const std::uint8_t* opcode,
+		std::size_t length, const std::uint64_t* gprs, std::uint64_t& ea,
+		std::uint64_t& bytes)
+	{
+		if (!opcode || !gprs || !length)
+			return false;
+		std::size_t index = 0;
+		bool rep = false, rex_w = false;
+		while (index < length)
+		{
+			const auto byte = opcode[index];
+			if (byte == 0xF3)
+			{
+				rep = true;
+				++index;
+			}
+			else if (byte == 0x66 || byte == 0x67 || byte == 0x2E ||
+				byte == 0x36 || byte == 0x3E || byte == 0x26 ||
+				byte == 0x64 || byte == 0x65)
+				++index;
+			else if (byte >= 0x40 && byte <= 0x4F)
+			{
+				if (byte & 8)
+					rex_w = true;
+				++index;
+			}
+			else
+				break;
+		}
+		if (!rep || index >= length)
+			return false;
+		const auto op = opcode[index];
+		std::uint64_t size;
+		if (op == 0xA4 || op == 0xAA)
+			size = 1;
+		else if (op == 0xA5 || op == 0xAB)
+			size = rex_w ? 8 : 4;
+		else
+			return false;
+		const std::uint64_t count = gprs[1];
+		if (!count)
+			return false;
+		ea = gprs[7];
+		bytes = count * size;
+		return true;
+	}
+
+	void record_block_write(std::uint64_t insn_seq, std::uint64_t ea,
+		std::uint64_t bytes)
+	{
+		++writes_block_;
+		if (!write_log_cap_)
+			return;
+		if (write_log_.size() < write_log_cap_)
+		{
+			write_entry entry;
+			entry.insn_seq = insn_seq;
+			entry.ea = ea;
+			entry.value = bytes;
+			entry.width = 0;
+			write_log_.push_back(entry);
+		}
+		else
+			write_log_capped_ = true;
 	}
 
 	void record_write(std::uint64_t insn_seq, const store& decoded)
@@ -1195,6 +1269,7 @@ private:
 		write_sym_ = kFnvOffset;
 		writes_count_ = 0;
 		writes_skipped_ = 0;
+		writes_block_ = 0;
 		write_log_.clear();
 		write_log_capped_ = false;
 		ctrl_hash_ = kFnvOffset;
@@ -1438,7 +1513,8 @@ private:
 			write_hex(stream_, write_hash_);
 			stream_ << ",\"writes_sym64\":";
 			write_hex(stream_, write_sym_);
-			stream_ << ",\"writes_skipped\":" << writes_skipped_;
+			stream_ << ",\"writes_block\":" << writes_block_
+				<< ",\"writes_skipped\":" << writes_skipped_;
 			if (write_log_cap_ && !write_log_.empty())
 			{
 				stream_ << ",\"wlog\":[";
@@ -1545,6 +1621,7 @@ private:
 	std::uint64_t write_sym_ = kFnvOffset;
 	std::uint64_t writes_count_ = 0;
 	std::uint64_t writes_skipped_ = 0;
+	std::uint64_t writes_block_ = 0;
 	std::vector<write_entry> write_log_;
 	bool write_log_capped_ = false;
 	bool ctrl_enabled_ = false;
