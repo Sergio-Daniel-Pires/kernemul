@@ -8,6 +8,7 @@
 #include <charconv>
 #include <format>
 #include <cstring>
+#include <cstdlib>
 
 namespace {
 
@@ -90,7 +91,25 @@ std::shared_ptr<proc_module> krnl::map_img(process& proc, const std::string_view
 
 	const auto size = img->size();
 	const auto space = proc.addr_space();
-	const addr_t addr = space->alloc(size, flags);
+
+	// KERNEMUL_IMAGE_BASE=<va> maps the module under test at an explicit base
+	// (KERNEMUL_IMAGE_BASE_MODULE, default "target_driver").  Reproduces a
+	// module loaded at its PE ImageBase so delta == 0, like the LWK image.
+	addr_t addr = 0;
+	if (const char* base_env = std::getenv("KERNEMUL_IMAGE_BASE"); base_env && *base_env && !skip_imports)
+	{
+		std::string_view want = "target_driver";
+		if (const char* mod_env = std::getenv("KERNEMUL_IMAGE_BASE_MODULE"); mod_env && *mod_env)
+			want = mod_env;
+		if (name.find(want) != std::string_view::npos)
+		{
+			addr = space->alloc_at(static_cast<addr_t>(std::strtoull(base_env, nullptr, 0)), size, flags);
+			LOG_INFO("[IMAGE_BASE] {} mapped at 0x{:X} (preferred 0x{:X})", name, addr,
+				static_cast<addr_t>(img->nt_hdrs()->optional_hdr.image_base));
+		}
+	}
+	if (!addr)
+		addr = space->alloc(size, flags);
 
 	if (!addr)
 	{
@@ -150,12 +169,12 @@ std::shared_ptr<proc_module> krnl::map_img(process& proc, const std::string_view
 
 	const addr_t delta = addr - img->base_addr();
 
-	if (const auto* lc = img->load_config(); lc && lc->security_cookie)
-	{
-		const auto cookie_rva = lc->security_cookie - img->base_addr();
-		const auto cookie_val = space->read_mem<std::uint64_t>(addr + cookie_rva);
-		space->write_mem(addr + cookie_rva, cookie_val + delta);
-	}
+	// The MSVC __security_cookie is an opaque value, not a relocatable
+	// pointer: Windows does not rebase it.  Rebasing it here made the cookie
+	// differ from the module default, so __security_init_cookie saw a custom
+	// cookie and skipped the RDTSC initialization (observed in the F4-skip
+	// chunk comparison at 0x5A534).  Leave it byte-faithful; the CRT
+	// initializes it at runtime.
 
 	for (const auto reloc : img->relocs())
 	{

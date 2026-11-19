@@ -87,6 +87,19 @@ inline _KUSER_SHARED_DATA make_default_kuser_shared_data(const std::size_t proce
 	sd.LargePageMinimum = 0x200000;
 	sd.TickCountMultiplier = default_tick_count_multiplier;
 
+	auto& det = win::determinism::instance();
+	if (det.enabled())
+	{
+		sd.NtBuildNumber = det.build_number();
+		sd.TickCountMultiplier = det.tick_multiplier();
+		sd.ActiveProcessorCount = det.processor_count();
+		sd.Cookie = det.security_cookie();
+		const auto bias = det.timezone_bias_100ns();
+		sd.TimeZoneBias.LowPart = static_cast<std::uint32_t>(bias);
+		sd.TimeZoneBias.High1Time = static_cast<std::int32_t>(bias >> 32);
+		sd.TimeZoneBias.High2Time = static_cast<std::int32_t>(bias >> 32);
+	}
+
 	const auto root_chars = std::min(windows_dir.size(), std::size(sd.NtSystemRoot) - 1);
 	std::char_traits<char16_t>::copy(sd.NtSystemRoot, windows_dir.data(), root_chars);
 	sd.NtSystemRoot[root_chars] = u'\0';

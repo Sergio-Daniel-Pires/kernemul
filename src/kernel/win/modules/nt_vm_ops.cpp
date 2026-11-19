@@ -268,6 +268,8 @@ vm_target resolve_target(win_kernel_state& state, vcpu& cpu, const std::uint64_t
 
 	if (!(entry->access & any_of_access))
 	{
+		THREAD_LOG_WARN("[ACCESS_DENIED] vm:target handle=0x{:X} access=0x{:X} needed=0x{:X}",
+			handle, entry->access, any_of_access);
 		target.status = STATUS_ACCESS_DENIED;
 		return target;
 	}
@@ -962,7 +964,11 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				const auto needed = section_access_needed(win32_protect);
 
 				if (!entry || (entry->access & needed) != needed)
+				{
+					THREAD_LOG_WARN("[ACCESS_DENIED] vm:map_section handle=0x{:X} needed=0x{:X}",
+						section_handle, needed);
 					return STATUS_ACCESS_DENIED;
+				}
 
 				if (rights_of(win32_protect).copy_on_write)
 					THREAD_LOG_WARN("NtMapViewOfSection: copy-on-write is not tracked, so a "
@@ -1160,7 +1166,11 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			const auto required = to_remote ? process_vm_write | process_vm_operation : process_vm_read;
 
 			if ((entry->access & required) != required)
+			{
+				THREAD_LOG_WARN("[ACCESS_DENIED] vm:process_vm handle=0x{:X} access=0x{:X} "
+					"needed=0x{:X}", process_handle, entry->access, required);
 				return STATUS_ACCESS_DENIED;
+			}
 
 			const auto target = st->find_process(static_cast<process::id_type>(process->pid));
 			remote = target ? target->addr_space() : nullptr;

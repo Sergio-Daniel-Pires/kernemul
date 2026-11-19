@@ -94,7 +94,11 @@ token_lookup resolve_token(win_kernel_state& state, token_state& tokens, vcpu& c
 			return { STATUS_OBJECT_TYPE_MISMATCH };
 
 		if ((entry->access & required) != required)
+		{
+			THREAD_LOG_WARN("[ACCESS_DENIED] token:required handle=0x{:X} access=0x{:X} "
+				"needed=0x{:X}", handle, entry->access, required);
 			return { STATUS_ACCESS_DENIED };
+		}
 
 		return { STATUS_SUCCESS, std::move(token), entry->access };
 	}

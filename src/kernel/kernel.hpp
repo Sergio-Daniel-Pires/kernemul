@@ -8,6 +8,7 @@
 #include "../util/log.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <span>
 #include <format>
@@ -21,6 +22,9 @@
 #include <unordered_map>
 
 using redirect_fn = std::function<void(vcpu&)>;
+
+// One-shot deferred memory-watch installation (see install_mem_write_watch()).
+extern std::function<void(emu&, vcpu&)> g_arm_pending_watch;
 
 struct os_exception
 {
@@ -189,8 +193,18 @@ struct kernel_state
 		auto a = emu_->arch();
 
 		emu_->hook_code(mod.addr, mod.addr + mod.size - 1,
-			[redirections, m, a](vcpu& cpu, addr_t addr, std::size_t)
+			[redirections, m, a, this](vcpu& cpu, addr_t addr, std::size_t)
 			{
+				// The watch is armed here rather than at setup: the driver's thread
+				// stack only exists once the entry thread runs, and Unicorn does not
+				// deliver memory hooks for a range that is unmapped when they are added.
+				if (g_arm_pending_watch)
+				{
+					auto arm = std::move(g_arm_pending_watch);
+					g_arm_pending_watch = nullptr;
+					arm(*emu_, cpu);
+				}
+
 				const auto it = redirections->find(addr);
 
 				if (it != redirections->end())
@@ -209,6 +223,21 @@ struct kernel_state
 					// Stopping the cpu moves the pc on some architectures, so it is put back.
 					if (cpu.pc() == addr)
 						cpu.set_pc(a->ret_addr(cpu));
+
+					// KERNEMUL_LOG_STUB_RET=1: report the value each redirected
+					// call returns (Windows x64: RAX), so a failing status in the
+					// guest log can be traced back to the API that produced it.
+					static const bool log_stub_ret = []
+					{
+						const char* v = std::getenv("KERNEMUL_LOG_STUB_RET");
+						return v && *v == '1';
+					}();
+					if (log_stub_ret)
+					{
+						THREAD_LOG_INFO("[STUB_RET] {}!{} -> 0x{:X}", m->name,
+							name_at(*m, addr),
+							cpu.reg<std::uint64_t>(static_cast<reg_t>(0)));
+					}
 
 					return;
 				}

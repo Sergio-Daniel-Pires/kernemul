@@ -640,7 +640,11 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 					return STATUS_OBJECT_TYPE_MISMATCH;
 
 				if (!(entry->access & win::sec::token_impersonate))
+				{
+					THREAD_LOG_WARN("[ACCESS_DENIED] task:token_impersonate handle=0x{:X} "
+						"access=0x{:X}", token_handle, entry->access);
 					return STATUS_ACCESS_DENIED;
+				}
 
 				std::scoped_lock lock(token->mtx);
 

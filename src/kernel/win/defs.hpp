@@ -1,4 +1,6 @@
 #pragma once
+
+#include "determinism.hpp"
 #include "linked_list.hpp"
 #include "types.hpp"
 #include <chrono>
@@ -103,6 +105,10 @@ using win_ticks = std::chrono::duration<std::int64_t, std::ratio<1, 10000000>>;
 
 inline std::int64_t win_system_time()
 {
+	auto& det = win::determinism::instance();
+	if (det.enabled())
+		return det.system_time_100ns();
+
 	const auto now = std::chrono::system_clock::now().time_since_epoch();
 	return win_epoch_delta_100ns + std::chrono::duration_cast<win_ticks>(now).count();
 }

@@ -21,6 +21,7 @@ namespace x86
 	struct addr_space : ::addr_space
 	{
 		addr_t alloc(std::size_t size, mem_prot prot) override;
+		addr_t alloc_at(addr_t va, std::size_t size, mem_prot prot) override;
 		addr_t map_phys(addr_t pa, std::size_t size, mem_prot prot) override;
 
 		addr_t pml4_pa = 0;

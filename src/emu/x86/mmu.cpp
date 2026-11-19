@@ -3,6 +3,8 @@
 #include "../emu.hpp"
 #include <stdexcept>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 
 namespace ia32 {
 #include <ia32.hpp>
@@ -283,6 +285,8 @@ void mmu::copy_virt(const addr_space& space, addr_t va, void* buf, std::size_t s
 {
 	auto* bytes = static_cast<std::uint8_t*>(buf);
 	std::size_t done = 0;
+	const char* watch_env = write ? std::getenv("KERNEMUL_MEM_WRITE_WATCH") : nullptr;
+	const addr_t write_watch = watch_env ? std::strtoull(watch_env, nullptr, 0) : 0;
 
 	while (done < size)
 	{
@@ -303,7 +307,25 @@ void mmu::copy_virt(const addr_space& space, addr_t va, void* buf, std::size_t s
 		const addr_t pa = *frame + page_off;
 
 		if (write)
+		{
+			if (write_watch && cur_va <= write_watch + 7 && cur_va + chunk > write_watch)
+			{
+				const addr_t overlap = std::max(cur_va, write_watch);
+				const auto offset = static_cast<std::size_t>(overlap - cur_va);
+				const auto n = std::min<std::size_t>(8, chunk - offset);
+				std::uint64_t old_value = 0;
+				std::uint64_t new_value = 0;
+				read_phys(pa + offset, &old_value, n);
+				std::memcpy(&new_value, bytes + done + offset, n);
+				std::fprintf(stderr,
+					"[MMU_WRITE_WATCH] va=0x%llX pa=0x%llX size=%zu old=0x%016llX incoming=0x%016llX\n",
+					static_cast<unsigned long long>(overlap),
+					static_cast<unsigned long long>(pa + offset), n,
+					static_cast<unsigned long long>(old_value),
+					static_cast<unsigned long long>(new_value));
+			}
 			write_phys(pa, bytes + done, chunk);
+		}
 		else
 			read_phys(pa, bytes + done, chunk);
 
@@ -439,6 +461,15 @@ addr_t addr_space::alloc(std::size_t size, mem_prot prot)
 	addr_t& cursor = (prot & prot_supervisor) ? kernel_next_ : user_next_;
 	addr_t va = cursor;
 	cursor += aligned;
+
+	mmu_->map_virt(*this, va, aligned, prot);
+	return va;
+}
+
+addr_t addr_space::alloc_at(addr_t va, std::size_t size, mem_prot prot)
+{
+	constexpr std::size_t page = 0x1000;
+	const auto aligned = (size + page - 1) & ~(page - 1);
 
 	mmu_->map_virt(*this, va, aligned, prot);
 	return va;

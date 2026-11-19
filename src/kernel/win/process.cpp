@@ -1,4 +1,5 @@
 #include "process.hpp"
+#include <cstdlib>
 #include "thread.hpp"
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
@@ -27,7 +28,15 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 	const auto id = static_cast<thread_id_type>(objs_.allocate_id());
 	const auto size = thread_stack_size(stack_size);
 
-	const addr_t stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
+	// KERNEMUL_STACK_BASE=<va>: put kernel thread stacks at an explicit base so a
+	// comparison can reproduce another runtime's stack address (the packer keys
+	// part of its VM state on rsp).
+	addr_t stack_base = 0;
+	if (const char* stack_env = std::getenv("KERNEMUL_STACK_BASE"); stack_env && *stack_env)
+		stack_base = addr_space_->alloc_at(static_cast<addr_t>(std::strtoull(stack_env, nullptr, 0)),
+			size, prot_rw | prot_supervisor);
+	if (!stack_base)
+		stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
 	auto self = std::static_pointer_cast<windows_process>(shared_from_this());
 	auto t = std::make_shared<win_kernel_thread>(
 		id, std::move(self), start_addr, stack_base, size, cpu);

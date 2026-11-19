@@ -9,6 +9,14 @@ struct addr_space
 	virtual ~addr_space() = default;
 	virtual addr_t alloc(std::size_t size, mem_prot prot) = 0;
 
+	// Map at an explicit VA. Used to reproduce a relocated module (an image
+	// loaded at its PE ImageBase instead of the kernel-space bump allocator).
+	virtual addr_t alloc_at(addr_t va, std::size_t size, mem_prot prot)
+	{
+		(void)va; (void)size; (void)prot;
+		return 0;
+	}
+
 	// Both `pa` and `size` are page aligned by the caller.
 	virtual addr_t map_phys(addr_t pa, std::size_t size, mem_prot prot) = 0;
 

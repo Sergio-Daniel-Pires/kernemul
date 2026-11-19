@@ -195,4 +195,69 @@ void modules::register_ntoskrnl_pool_ops(win_kernel_state& state, proc_module& m
 	{
 		release(*st, "ExFreePool", address, 0);
 	});
+
+	// GENERAL_LOOKASIDE (x64): Type +0x24, Tag +0x28, Size +0x2C.
+	// The packer resolves these dynamically and the driver never calls
+	// ExInitializePagedLookasideList, so the fields can still be zero here.
+	const auto lookaside_allocate = [st](vcpu& cpu, const std::string_view who,
+		const addr_t lookaside) -> addr_t
+	{
+		std::uint32_t type = 0;
+		std::uint32_t tag = 0;
+		std::uint32_t size = 0;
+		try
+		{
+			cpu.read_virt_mem(lookaside + 0x24, &type, sizeof(type));
+			cpu.read_virt_mem(lookaside + 0x28, &tag, sizeof(tag));
+			cpu.read_virt_mem(lookaside + 0x2C, &size, sizeof(size));
+		}
+		catch (...)
+		{
+		}
+
+		if (size == 0 || size > 0x100000)
+		{
+			THREAD_LOG_WARN("{}: lookaside 0x{:X} has Size={} Type=0x{:X} Tag='{}'; using 0x100",
+				who, lookaside, size, type, pool_tag_name(tag));
+			size = 0x100;
+		}
+
+		const auto flags = (type & pool_type_paged)
+			? pool_flags_from_type(type)
+			: (type ? pool_flags_from_type(type) : pool_flag_paged);
+
+		return allocate(*st, who, flags, size, pool_type_tag(tag));
+	};
+
+	state.redirect(mod, "ExAllocateFromPagedLookasideList",
+		[lookaside_allocate](vcpu& cpu, const addr_t lookaside) -> addr_t
+		{
+			return lookaside_allocate(cpu, "ExAllocateFromPagedLookasideList",
+				lookaside);
+		});
+
+	state.redirect(mod, "ExAllocateFromNPagedLookasideList",
+		[lookaside_allocate](vcpu& cpu, const addr_t lookaside) -> addr_t
+		{
+			return lookaside_allocate(cpu, "ExAllocateFromNPagedLookasideList",
+				lookaside);
+		});
+
+	const auto lookaside_free = [st](const std::string_view who,
+		const addr_t entry)
+	{
+		release(*st, who, entry, 0);
+	};
+
+	state.redirect(mod, "ExFreeToPagedLookasideList",
+		[lookaside_free](vcpu&, const addr_t, const addr_t entry)
+		{
+			lookaside_free("ExFreeToPagedLookasideList", entry);
+		});
+
+	state.redirect(mod, "ExFreeToNPagedLookasideList",
+		[lookaside_free](vcpu&, const addr_t, const addr_t entry)
+		{
+			lookaside_free("ExFreeToNPagedLookasideList", entry);
+		});
 }

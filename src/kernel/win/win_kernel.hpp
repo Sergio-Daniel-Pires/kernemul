@@ -55,7 +55,11 @@ struct win_kernel_state : kernel_state
 
 	std::unordered_map<addr_t, std::uint64_t> views;
 
-	std::int64_t boot_time = static_cast<std::int64_t>(win_system_time());
+	std::int64_t boot_time = [] {
+		auto& det = win::determinism::instance();
+		return det.enabled() ? det.boot_time_100ns()
+			: static_cast<std::int64_t>(win_system_time());
+	}();
 
 	// Read out of the mapped ntoskrnl rather than hardcoded: guest_fs_dir is a build time switch
 	// across image sets that are already different builds, so the image is the only authority.
@@ -159,7 +163,11 @@ struct win_kernel_state : kernel_state
 		kuser_shared_data = emu_object<_KUSER_SHARED_DATA>(space, kuser_shared_data_kernel_va,
 			"KUSER_SHARED_DATA", true);
 		kuser_shared_data.write(make_default_kuser_shared_data(1));
-		kuser_shared_data.field(&_KUSER_SHARED_DATA::NtBuildNumber).write(nt_build_number);
+		{
+			auto& det = win::determinism::instance();
+			kuser_shared_data.field(&_KUSER_SHARED_DATA::NtBuildNumber)
+				.write(det.enabled() ? det.build_number() : nt_build_number);
+		}
 	}
 
 	// Nothing in a mapped module is ever executed, so the imports are not resolved either.
@@ -231,8 +239,14 @@ struct win_kernel_state : kernel_state
 	void publish_processor_count(const std::size_t processors)
 	{
 		if (kuser_shared_data)
+		{
+			auto& det = win::determinism::instance();
+			const auto count = det.enabled()
+				? det.processor_count()
+				: static_cast<std::uint32_t>(processors);
 			kuser_shared_data.field(&_KUSER_SHARED_DATA::ActiveProcessorCount)
-				.write(static_cast<std::uint32_t>(processors));
+				.write(count);
+		}
 
 		auto& space = kernel_space();
 
@@ -497,8 +511,14 @@ struct win_kernel_state : kernel_state
 		auto& pcpu = per_cpu_.emplace_back(space, static_cast<std::uint32_t>(cpu.id()),
 			non_paged_pool_lock);
 
-		kuser_shared_data.field(&_KUSER_SHARED_DATA::ActiveProcessorCount)
-			.write(static_cast<std::uint32_t>(per_cpu_.size()));
+		{
+			auto& det = win::determinism::instance();
+			const auto count = det.enabled()
+				? det.processor_count()
+				: static_cast<std::uint32_t>(per_cpu_.size());
+			kuser_shared_data.field(&_KUSER_SHARED_DATA::ActiveProcessorCount)
+				.write(count);
+		}
 
 		// The array the guest walks to reach a cpu other than the one it is on.
 		if (late_globals.ki_processor_block && cpu.id() < ki_processor_block_max)

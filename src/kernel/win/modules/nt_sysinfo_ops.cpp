@@ -353,6 +353,8 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 
 			const auto now = static_cast<std::int64_t>(win_system_time());
 			system_time.write(now);
+			win::determinism::instance().mock_log("NtQuerySystemTime",
+				static_cast<std::uint64_t>(now));
 
 			THREAD_LOG_INFO("NtQuerySystemTime() -> {}", now);
 
@@ -366,13 +368,27 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 			if (!performance_counter)
 				return STATUS_INVALID_PARAMETER;
 
-			const auto now = std::chrono::steady_clock::now().time_since_epoch();
-			const auto ticks = std::chrono::duration_cast<win_ticks>(now).count();
+			auto& det = win::determinism::instance();
+			std::int64_t ticks;
+			std::int64_t frequency;
+			if (det.enabled())
+			{
+				ticks = det.perf_counter();
+				frequency = static_cast<std::int64_t>(det.perf_frequency());
+				det.mock_log("NtQueryPerformanceCounter",
+					static_cast<std::uint64_t>(ticks));
+			}
+			else
+			{
+				const auto now = std::chrono::steady_clock::now().time_since_epoch();
+				ticks = std::chrono::duration_cast<win_ticks>(now).count();
+				frequency = win_ticks::period::den;
+			}
 
 			performance_counter.write(ticks);
 
 			if (performance_frequency)
-				performance_frequency.write(win_ticks::period::den);
+				performance_frequency.write(frequency);
 
 			THREAD_LOG_INFO("NtQueryPerformanceCounter() -> {}", ticks);
 
@@ -430,15 +446,21 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 				return STATUS_INFO_LENGTH_MISMATCH;
 
 			const auto now = static_cast<std::int64_t>(win_system_time());
+			auto& det = win::determinism::instance();
+			const auto boot_time = det.enabled() ? det.boot_time_100ns()
+				: st->boot_time;
 
 			system_time_of_day_information_t info{};
-			info.boot_time = st->boot_time;
+			info.boot_time = boot_time;
 			info.current_time = now;
+			info.time_zone_bias = det.enabled() ? det.timezone_bias_100ns() : 0;
+			det.mock_log("SystemTimeOfDayInformation",
+				static_cast<std::uint64_t>(now));
 
 			emu_object<system_time_of_day_information_t>(space, system_information).write(info);
 
 			THREAD_LOG_INFO("NtQuerySystemInformation(SystemTimeOfDayInformation): up {}s",
-				win_ticks(now - st->boot_time) / std::chrono::seconds(1));
+				win_ticks(now - boot_time) / std::chrono::seconds(1));
 
 			return STATUS_SUCCESS;
 		}

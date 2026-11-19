@@ -157,6 +157,7 @@ FetchContent_MakeAvailable(raw_pdb)
 # Target: kernemul
 set(kernemul_SOURCES
 	cmake.toml
+	"src/chunk_emitter.hpp"
 	"src/emu/addr_space.hpp"
 	"src/emu/arch.hpp"
 	"src/emu/arm64/addr_space.hpp"
@@ -203,6 +204,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/boot_seed.cpp"
 	"src/kernel/win/boot_seed.hpp"
 	"src/kernel/win/defs.hpp"
+	"src/kernel/win/determinism.hpp"
 	"src/kernel/win/dispatcher.hpp"
 	"src/kernel/win/driver.hpp"
 	"src/kernel/win/eprocess.hpp"
@@ -237,6 +239,8 @@ set(kernemul_SOURCES
 	"src/kernel/win/modules/nt_ex_ops.hpp"
 	"src/kernel/win/modules/nt_file_ops.cpp"
 	"src/kernel/win/modules/nt_file_ops.hpp"
+	"src/kernel/win/modules/nt_fsrtl_ops.cpp"
+	"src/kernel/win/modules/nt_fsrtl_ops.hpp"
 	"src/kernel/win/modules/nt_info_ops.cpp"
 	"src/kernel/win/modules/nt_info_ops.hpp"
 	"src/kernel/win/modules/nt_io_ops.cpp"

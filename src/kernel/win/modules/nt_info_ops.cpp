@@ -25,6 +25,19 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 	state.redirect(mod, "KeQueryPerformanceCounter",
 		[](vcpu&, emu_object<std::int64_t> frequency) -> std::int64_t
 		{
+			auto& det = win::determinism::instance();
+			if (det.enabled())
+			{
+				const auto ticks = det.perf_counter();
+				if (frequency)
+					frequency.write(static_cast<std::int64_t>(det.perf_frequency()));
+				det.mock_log("KeQueryPerformanceCounter",
+					static_cast<std::uint64_t>(ticks));
+				THREAD_LOG_INFO("KeQueryPerformanceCounter(frequency=0x{:X}) -> {} (deterministic)",
+					frequency.address(), ticks);
+				return ticks;
+			}
+
 			const auto now = std::chrono::steady_clock::now().time_since_epoch();
 			const auto ticks = std::chrono::duration_cast<win_ticks>(now).count();
 
@@ -39,8 +52,11 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 
 	state.redirect(mod, "KeQueryTimeIncrement", [](vcpu&) -> std::uint32_t
 	{
-		THREAD_LOG_INFO("KeQueryTimeIncrement() -> {}", clock_increment_100ns);
-		return clock_increment_100ns;
+		auto& det = win::determinism::instance();
+		const auto increment = det.enabled()
+			? det.clock_increment_100ns() : clock_increment_100ns;
+		THREAD_LOG_INFO("KeQueryTimeIncrement() -> {}", increment);
+		return increment;
 	});
 
 	// The precise form reads the same clock as KUSER_SHARED_DATA, not the value cached there.
@@ -51,6 +67,8 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 
 		const auto now = static_cast<std::int64_t>(win_system_time());
 		current_time.write(now);
+		win::determinism::instance().mock_log("KeQuerySystemTimePrecise",
+			static_cast<std::uint64_t>(now));
 
 		THREAD_LOG_INFO("KeQuerySystemTime() -> {}", now);
 	};

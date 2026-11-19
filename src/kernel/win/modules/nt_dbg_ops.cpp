@@ -52,6 +52,7 @@ void modules::register_ntoskrnl_dbg_ops(win_kernel_state& state, proc_module& mo
 			command, input_buffer, input_buffer_length, output_buffer, output_buffer_length);
 
 		// What the real one returns without a debugger: the privilege is the check that fails.
+		THREAD_LOG_WARN("[ACCESS_DENIED] dbg:system_debug_control command={}", command);
 		return STATUS_ACCESS_DENIED;
 	};
 
