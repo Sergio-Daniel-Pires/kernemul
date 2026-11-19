@@ -3,6 +3,7 @@
 #include "thread.hpp"
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
+#include "../../emu/x86/arch.hpp"
 #include "../../util/log.hpp"
 
 win_kernel_proc::win_kernel_proc(id_type id, win_kernel_state& kernel, std::shared_ptr<struct addr_space> space)
@@ -37,6 +38,12 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 			size, prot_rw | prot_supervisor);
 	if (!stack_base)
 		stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
+	// A Windows kernel thread starts with interrupts enabled (IF=1): the kernel
+	// runs with IF set outside critical sections, and a driver that captures its
+	// own context (RtlCaptureContext or a PUSHFQ) records that bit.  Leaving the
+	// emulated RFLAGS at the bare reset value makes every captured flags image
+	// differ from a runtime that executes natively.
+	reg_view{cpu}.set(x86::rflags, 0x202);
 	auto self = std::static_pointer_cast<windows_process>(shared_from_this());
 	auto t = std::make_shared<win_kernel_thread>(
 		id, std::move(self), start_addr, stack_base, size, cpu);
