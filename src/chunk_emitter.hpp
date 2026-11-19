@@ -633,6 +633,8 @@ private:
 	{
 		write_hash_ = writes_hash_update(write_hash_,
 			write_ea_token(decoded.ea), decoded.value, decoded.width);
+		write_sym_ = writes_sym_update(write_sym_, decoded.ea, decoded.value,
+			decoded.width);
 		++writes_count_;
 		if (!write_log_cap_)
 			return;
@@ -647,6 +649,27 @@ private:
 		}
 		else
 			write_log_capped_ = true;
+	}
+
+	// Same rule table as cpu_sym64, applied to the store EA and value, so a
+	// pointer store is not cross-environment noise.
+	std::uint64_t writes_sym_update(std::uint64_t hash, std::uint64_t ea,
+		std::uint64_t value, std::uint8_t width) const
+	{
+		std::uint8_t ea_cls = kCpuScalar, val_cls = kCpuScalar;
+		std::uint64_t ea_payload = 0, val_payload = 0;
+		cpu_classify(ea, ea_cls, ea_payload);
+		cpu_classify(value, val_cls, val_payload);
+		hash = fnv_u8(hash, ea_cls);
+		hash = fnv_u64(hash, ea_payload);
+		hash = fnv_u8(hash, width);
+		// Narrow stores carry pointer fragments (the low half of an address
+		// looks like a scalar and changes with ASLR), so only full 64-bit
+		// values participate.  EA and width still discriminate.
+		if (width < 8)
+			return hash;
+		hash = fnv_u8(hash, val_cls);
+		return fnv_u64(hash, val_payload);
 	}
 
 	static std::uint64_t writes_hash_update(std::uint64_t hash,
@@ -1169,6 +1192,7 @@ private:
 		blocks_ = 0;
 		last_was_boundary_ = false;
 		write_hash_ = kFnvOffset;
+		write_sym_ = kFnvOffset;
 		writes_count_ = 0;
 		writes_skipped_ = 0;
 		write_log_.clear();
@@ -1412,6 +1436,8 @@ private:
 		{
 			stream_ << ",\"writes64\":";
 			write_hex(stream_, write_hash_);
+			stream_ << ",\"writes_sym64\":";
+			write_hex(stream_, write_sym_);
 			stream_ << ",\"writes_skipped\":" << writes_skipped_;
 			if (write_log_cap_ && !write_log_.empty())
 			{
@@ -1516,6 +1542,7 @@ private:
 	bool writes_enabled_ = false;
 	std::size_t write_log_cap_ = 0;
 	std::uint64_t write_hash_ = kFnvOffset;
+	std::uint64_t write_sym_ = kFnvOffset;
 	std::uint64_t writes_count_ = 0;
 	std::uint64_t writes_skipped_ = 0;
 	std::vector<write_entry> write_log_;
