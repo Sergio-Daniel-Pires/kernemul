@@ -3,7 +3,9 @@
 //
 // CV3-lite: emit CV1-compatible chunk checkpoints from Kernemul.
 //
-// The file is JSON Lines (kchunk-v1).  Flow is FNV-1a 64 over the same bytes
+// The file is JSON Lines (kchunk-v1); with the per-step CPU digests enabled it
+// also carries "cpu":"fnv1a64" in the header and cpu_raw64/cpu_sym64 in every
+// record.  Flow is FNV-1a 64 over the same bytes
 // the Python side uses, so LWK .chunk files and Kernemul .kchunk files can be
 // compared directly.  CPU state is emitted raw at each boundary; the Python
 // reader hashes it with the same BLAKE2b-128 rules as the LWK checkpoints.
@@ -24,6 +26,19 @@
 //   KERNEMUL_CHUNK_CTRL_STACK=<base>:<size>    (classify stack targets)
 //   KERNEMUL_CHUNK_CTRL_THUNK=<base>:<size>    (classify thunk/other-module)
 //   KERNEMUL_CHUNK_CTRL_POOL=<base>:<size>     (classify pool targets)
+//   KERNEMUL_CHUNK_STACK=<base>:<size>[,...]   (cpu_sym64 stack classification)
+//   KERNEMUL_CHUNK_POOL=<base>:<size>[,...]    (cpu_sym64 pool classification)
+//   KERNEMUL_CHUNK_NO_CPU=1                    (debug: disable the per-step
+//                                               CPU digests, emit kchunk-v1)
+//
+// cpu_raw64 / cpu_sym64 are per-chunk FNV-1a 64 digests accumulated over every
+// observed step (the same rule as src/trace/lwk_chunk.c):
+//   raw - 16 GPRs little-endian, then RFLAGS.
+//   sym - for each GPR (class:u8, payload:u64): module -> 1 (payload = RVA),
+//         configured stack -> 2 (payload 0), configured pool -> 3 (payload 0),
+//         otherwise 0 (payload = value); RFLAGS always class 0 (payload =
+//         rflags).  RFLAGS is masked with 0xCD5 (architectural subset).
+// Both emitters must produce identical bytes for equivalent state.
 //
 // KERNEMUL_CHUNK_WRITES mirrors the LWK decoder (src/trace/lwk_chunk.c and
 // lwk-tools/chunk_domains.py): mov r/m,r 0x88/0x89, mov r/m,imm 0xC7 /0,
@@ -181,6 +196,11 @@ public:
 				++ctrl_skipped_;
 		}
 		flow_ = fnv_step(flow_, instruction_rva, opcode, length);
+		if (cpu_enabled_ && gprs)
+		{
+			cpu_raw_ = cpu_raw_update(cpu_raw_, rflags, gprs);
+			cpu_sym_ = cpu_sym_update(cpu_sym_, rflags, gprs);
+		}
 		++steps_;
 		last_was_boundary_ = is_boundary_instruction(opcode, length);
 		if (last_was_boundary_)
@@ -210,6 +230,13 @@ private:
 	static constexpr std::uint8_t kCtrlPool = 2;
 	static constexpr std::uint8_t kCtrlThunk = 3;
 	static constexpr std::uint8_t kCtrlUnread = 4;
+	// cpu_sym64 value classes (not the CTRL target classes).
+	static constexpr std::uint8_t kCpuScalar = 0;
+	static constexpr std::uint8_t kCpuModule = 1;
+	static constexpr std::uint8_t kCpuStack = 2;
+	static constexpr std::uint8_t kCpuPool = 3;
+	static constexpr std::uint64_t kCpuFlagsMask = UINT64_C(0xCD5);
+	static constexpr std::size_t kMaxCpuRanges = 4;
 
 	chunk_emitter() { initialize(); }
 	~chunk_emitter() { finish(); }
@@ -299,6 +326,11 @@ private:
 		ctrl_stack_ = parse_range(std::getenv("KERNEMUL_CHUNK_CTRL_STACK"));
 		ctrl_thunk_ = parse_range(std::getenv("KERNEMUL_CHUNK_CTRL_THUNK"));
 		ctrl_pool_ = parse_range(std::getenv("KERNEMUL_CHUNK_CTRL_POOL"));
+		// Per-step CPU digests: on by default.  KERNEMUL_CHUNK_NO_CPU is a
+		// debug switch to measure emitter cost, not a comparison mode.
+		cpu_enabled_ = parse_u64(std::getenv("KERNEMUL_CHUNK_NO_CPU"), 0) == 0;
+		parse_range_list(std::getenv("KERNEMUL_CHUNK_STACK"), cpu_stack_);
+		parse_range_list(std::getenv("KERNEMUL_CHUNK_POOL"), cpu_pool_);
 		if (const char* watch = std::getenv("KERNEMUL_CHUNK_WATCH"))
 			parse_watch(watch);
 
@@ -663,6 +695,37 @@ private:
 			value - range.base < range.size;
 	}
 
+	// ``<base>:<size>[,<base>:<size>...]`` (``;`` also accepted), capped.
+	static void parse_range_list(const char* text,
+		std::vector<ctrl_range>& out)
+	{
+		if (!text || !*text)
+			return;
+		const std::string list(text);
+		std::size_t pos = 0;
+		while (pos <= list.size() && out.size() < kMaxCpuRanges)
+		{
+			const auto end = list.find_first_of(",;", pos);
+			const std::string item = list.substr(pos,
+				end == std::string::npos ? std::string::npos : end - pos);
+			const ctrl_range range = parse_range(item.c_str());
+			if (range.size)
+				out.push_back(range);
+			if (end == std::string::npos)
+				break;
+			pos = end + 1;
+		}
+	}
+
+	static bool range_list_contains(const std::vector<ctrl_range>& ranges,
+		std::uint64_t value)
+	{
+		for (const auto& range : ranges)
+			if (range_contains(range, value))
+				return true;
+		return false;
+	}
+
 	std::uint8_t classify_ctrl_target(std::uint64_t target) const
 	{
 		if (base_ && image_size_ && target - base_ < image_size_)
@@ -811,6 +874,79 @@ private:
 	std::uint64_t rva(std::uint64_t rip) const
 	{
 		return base_ ? rip - base_ : rip;
+	}
+
+	// -- per-step CPU digests (CPU_RAW / CPU_SYMBOLIC) ----------------------
+	// Mirror of src/trace/lwk_chunk.c: both emitters must hash the same bytes
+	// for equivalent state, so the two sides are directly comparable.
+	static void cpu_classify(std::uint64_t value, std::uint64_t base,
+		std::uint64_t image_size, const std::vector<ctrl_range>& stack,
+		const std::vector<ctrl_range>& pool, std::uint8_t& cls,
+		std::uint64_t& payload)
+	{
+		if (base && image_size && value - base < image_size)
+		{
+			cls = kCpuModule;
+			payload = value - base;
+			return;
+		}
+		if (range_list_contains(stack, value))
+		{
+			cls = kCpuStack;
+			payload = 0;
+			return;
+		}
+		if (range_list_contains(pool, value))
+		{
+			cls = kCpuPool;
+			payload = 0;
+			return;
+		}
+		cls = kCpuScalar;
+		payload = value;
+	}
+
+	static std::uint64_t cpu_raw_update(std::uint64_t hash,
+		std::uint64_t rflags, const std::uint64_t* gprs)
+	{
+		for (unsigned index = 0; index < 16; ++index)
+			hash = fnv_u64(hash, gprs[index]);
+		return fnv_u64(hash, rflags & kCpuFlagsMask);
+	}
+
+	std::uint64_t cpu_sym_update(std::uint64_t hash, std::uint64_t rflags,
+		const std::uint64_t* gprs) const
+	{
+		for (unsigned index = 0; index < 16; ++index)
+		{
+			std::uint8_t cls = kCpuScalar;
+			std::uint64_t payload = 0;
+			cpu_classify(gprs[index], base_, image_size_, cpu_stack_,
+				cpu_pool_, cls, payload);
+			hash = fnv_u8(hash, cls);
+			hash = fnv_u64(hash, payload);
+		}
+		hash = fnv_u8(hash, kCpuScalar);
+		return fnv_u64(hash, rflags & kCpuFlagsMask);
+	}
+
+	static std::uint64_t fnv_u64(std::uint64_t hash, std::uint64_t value)
+	{
+		std::uint8_t bytes[8];
+		for (unsigned index = 0; index < 8; ++index)
+			bytes[index] = static_cast<std::uint8_t>(value >> (index * 8));
+		for (const auto byte : bytes)
+		{
+			hash ^= byte;
+			hash *= kFnvPrime;
+		}
+		return hash;
+	}
+
+	static std::uint64_t fnv_u8(std::uint64_t hash, std::uint8_t value)
+	{
+		hash ^= value;
+		return hash * kFnvPrime;
 	}
 
 	// Region pairs mirror the LWK TF controls.  A value is accepted either as a
@@ -966,6 +1102,8 @@ private:
 		ctrl_skipped_ = 0;
 		ctrl_log_.clear();
 		ctrl_log_capped_ = false;
+		cpu_raw_ = kFnvOffset;
+		cpu_sym_ = kFnvOffset;
 	}
 
 	static bool is_rep_string_opcode(const std::uint8_t* opcode,
@@ -1116,6 +1254,8 @@ private:
 			<< "\",\"ignore_pairs\":\"" << ignore_pairs_text_
 			<< "\",\"allow_pairs\":\"" << allow_pairs_text_
 			<< "\",\"flow_hash\":\"fnv1a64\"";
+		if (cpu_enabled_)
+			stream_ << ",\"cpu\":\"fnv1a64\"";
 		stream_ << ",\"watch\":[";
 		for (std::size_t i = 0; i < watch_.size(); ++i)
 		{
@@ -1146,6 +1286,13 @@ private:
 			<< ",\"n_blocks\":" << blocks_
 			<< ",\"flow64\":";
 		write_hex(stream_, flow_);
+		if (cpu_enabled_)
+		{
+			stream_ << ",\"cpu_raw64\":";
+			write_hex(stream_, cpu_raw_);
+			stream_ << ",\"cpu_sym64\":";
+			write_hex(stream_, cpu_sym_);
+		}
 		stream_ << ",\"final\":" << (final ? "true" : "false");
 		if (final)
 		{
@@ -1307,4 +1454,9 @@ private:
 	ctrl_range ctrl_stack_;
 	ctrl_range ctrl_thunk_;
 	ctrl_range ctrl_pool_;
+	bool cpu_enabled_ = true;
+	std::uint64_t cpu_raw_ = kFnvOffset;
+	std::uint64_t cpu_sym_ = kFnvOffset;
+	std::vector<ctrl_range> cpu_stack_;
+	std::vector<ctrl_range> cpu_pool_;
 };
