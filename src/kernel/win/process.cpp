@@ -1,5 +1,6 @@
 #include "process.hpp"
 #include <cstdlib>
+#include <vector>
 #include "thread.hpp"
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
@@ -38,6 +39,25 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 			size, prot_rw | prot_supervisor);
 	if (!stack_base)
 		stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
+	// KERNEMUL_STACK_PATTERN=<byte>: fill the thread stack before the startup
+	// frame.  A driver that reads stack bytes it never wrote (the packer does
+	// when it hashes its own context) then sees the same bytes on a runtime that
+	// offers the equivalent fill (LWK_STACK_PATTERN) instead of whatever the
+	// allocator left behind.
+	if (const char* pattern = std::getenv("KERNEMUL_STACK_PATTERN");
+		pattern && *pattern)
+	{
+		const auto byte = static_cast<std::uint8_t>(
+			std::strtoul(pattern, nullptr, 16));
+		// The base may be deliberately unaligned (KERNEMUL_STACK_BASE), so fill
+		// only the pages fully inside the mapping.
+		constexpr addr_t page = 0x1000;
+		const addr_t begin = (stack_base + page - 1) & ~(page - 1);
+		const addr_t end = (stack_base + size) & ~(page - 1);
+		std::vector<std::uint8_t> fill(page, byte);
+		for (addr_t va = begin; va < end; va += page)
+			addr_space_->write_mem(va, fill.data(), fill.size());
+	}
 	// A Windows kernel thread starts with interrupts enabled (IF=1): the kernel
 	// runs with IF set outside critical sections, and a driver that captures its
 	// own context (RtlCaptureContext or a PUSHFQ) records that bit.  Leaving the
